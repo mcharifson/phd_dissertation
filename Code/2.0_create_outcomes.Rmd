@@ -1,0 +1,136 @@
+---
+title: 'Step 2.0: Outcome Creation'
+author: "Mia Charifson"
+date: `r Sys.Date()`
+output: html_document
+---
+
+# Derive outcome variables
+
+Goals of this document:
+- Using algorithm to assign diagnosis confidence to each case
+- Identify patients for whom we need to manually review notes
+
+```{r lib, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(lubridate)
+library(tableone)
+library(arsenal)
+library(readxl)
+```
+
+```{r load}
+tab1 <- read.csv('Data/Epic/table1_pat_cohort.csv') # replace with final cohort from step 1
+tab3 <- read.csv('./Data/Epic/table3_diagnosis_uf_endo.csv')
+tab4_proc <- read.csv('Data/Epic/table4_procedure_order.csv') 
+tab4_surg <- read.csv('Data/Epic/table4_surgical_procedure.csv')
+```
+
+## Uterine fibroids
+
+```{r uf_dx}
+# capture the first Dx code if any, date, and encounter type at first Dx code
+tab3 %>% 
+  filter(grepl('D25', icd10)) %>%
+  mutate(dx_date = as.Date(dx_date)) %>%
+  group_by(pat_id) %>%
+  summarise(uf_dx_date=min(dx_date),
+            # record the total number of UF Dx codes ever dropped in EHR
+            uf_dx_count=n())
+```
+
+```{r uf_image}
+# look for imaging study within 3 months of this Dx date, if so grab date
+
+# if there is imaging study do they have another Dx code after the imaging? y/n
+```
+
+```{r uf_surgery}
+# look for surgery within 3 months of this Dx date, if so grab date
+
+# if there is surgery do they have another Dx code after the imaging? y/n
+```
+
+```{r uf_method}
+# apply algorithm for Dx type
+
+# decide confidence of Dx based on algorithm
+```
+
+# Endometriosis
+
+```{r endo_dx}
+# capture the first Dx code if any, date, and encounter type at first Dx code
+tab3 %>% 
+  filter(grepl('N80', icd10) & !grepl('N80.03', icd10) ) %>%
+  mutate(dx_date = as.Date(dx_date)) %>%
+  group_by(pat_id) %>%
+  summarise(endo_dx_date=min(dx_date),
+            # record the total number of Dx codes ever dropped in EHR
+            endo_dx_count=n())
+```
+
+```{r endo_image}
+# look for imaging study within 3 months of this Dx date, if so grab date
+
+# if there is imaging study do they have another Dx code after the imaging? y/n
+```
+
+```{r endo_surgery}
+# look for surgery within 3 months of this Dx date, if so grab date
+
+# if there is surgery do they have another Dx code after the imaging? y/n
+```
+
+```{r endo_method}
+# apply algorithm for Dx type
+
+# decide confidence of Dx based on algorithm
+```
+
+# Adenomyosis
+
+```{r adeno_dx}
+# do they have any adeno Dx codes
+
+# do they have more than 2 adeno Dx codes
+```
+
+```{r adeno_imaging}
+# look for imaging study within 3 months of this Dx date, if so grab date
+```
+
+```{r adeno_surgery}
+# look for surgery within 3 months of this Dx date, if so grab date
+```
+
+```{r adeno_decision}
+# decide adenomyosis sensitivity analysis type for this patients
+```
+
+# First symptoms
+
+```{r uf_symptoms}
+# look for earliest code drop for any UF symptom code, grab date
+```
+
+```{r endo_symptoms}
+# look for earliest code drop for any Endo symptom code, grab date
+```
+
+```{r all_symptoms}
+# look for all symptoms and number of them in EHR for patients who never get diagnosed
+
+# these comprise the potential false negatives
+```
+
+# Time to diagnosis
+
+```{r uf_ttp}
+# calculate ttp from first symptom to UF diagnosis
+```
+
+```{r endo_ttp}
+# calculate ttp from first symptom to Endo diagnosis
+```

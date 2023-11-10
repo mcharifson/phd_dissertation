@@ -1,0 +1,145 @@
+---
+title: "Step 3.1: Mapping ICE"
+author: "Mia Charifson"
+date: "2023-10-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE, message=FALSE, fig.width=6,
+                      fig.height = 4)
+```
+
+## Instructions
+
+Analysis and presentation of data (~4-5 pages double spaced)
+
+Use the CHDB to explore the relationship between your health outcome Y and chosen measure of interest. Be creative- you have complete flexibility on how/what you present, but you must present at 4-5 exhibits (e.g. tables, graphs, maps) including at least one comparing the relationship of the chosen measure with outcome Y across census tracks within your city, and one comparing the relationship of the chosen measure with outcome Y relative to other cities. You should incorporate descriptive statistics (e.g. means, distribution, correlations) as appropriate. 
+
+For each exhibit:
+
+A. Ensure it is visually appealing, easily interpretable, and includes appropriate titles and labels
+
+B. Clearly delineate what it is presenting
+
+C. Describe in terms to be understood by non-scientific audiences what each exhibit/analysis show us in relation to any relationships/disparities noted
+
+```{r load}
+library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+library(sf)
+library(tidycensus)
+
+setwd("~/Dropbox (NYU Langone Health)/Classes/Semester 3/Translating Epi Methods")
+mass <- read.csv("CHDB_data_tract_MA_v13.1.csv")
+```
+
+## Within Boston Census-Tracts: Broadband Connection & Frequent Mental Distress (FMD)
+
+```{r reshape}
+bb <- mass %>% filter(metric_number==40) %>%
+  select(city_name, tract_code, est, lci, uci, data_yr_type)
+names(bb)[3:6] <- c("bb_est", "bb_lci", "bb_uci", "bb_data_yr")
+fmd <- mass %>% filter(metric_number==7) %>%
+  select(city_name, tract_code, est, lci, uci, data_yr_type, geo_level)
+names(fmd)[3:6] <- c("fmd_est", "fmd_lci", "fmd_uci", "fmd_data_yr")
+df_bos <- bb %>% filter(city_name == "Boston") %>% 
+  left_join(fmd %>% select(-city_name), by="tract_code")
+```
+
+The percent of households in Boston averaging across all census tracts (CT) that have high-speed internet connection is `r round(mean(df_bos$bb_est, na.rm=T),3)` (SD=`r round(sd(df_bos$bb_est, na.rm=T),3)`). The percent of adults (≥18 yrs old) in Boston, averaging across all CTs, that experienced frequent mental distress in the past month is `r round(mean(df_bos$fmd_est, na.rm=T),3)` (SD=`r round(sd(df_bos$fmd_est, na.rm=T),3)`). This indicates that on average most census tracts have a high percentage of households with high-speed internet connection and a low percentage of adults who experience frequent mental distress (Figure 1). 
+
+```{r hist, fig.cap="Figure 1: Census Tract Variable Distributions"}
+p1 <- ggplot(aes(x=bb_est), data=df_bos) + 
+  geom_histogram(bins=50, fill="orange", col="black") + theme_bw() +
+  xlab("% Households with High-Speed Internet Connection") + 
+  geom_vline(xintercept=75.1, color="red")
+p2 <- ggplot(aes(x=fmd_est), data=df_bos) + 
+  geom_histogram(bins=50, fill="purple", col="black") + theme_bw() +
+  xlab("% Adults with Frequent Mental Distress") + 
+  geom_vline(xintercept=14.6, color="red")
+
+ggarrange(p1, p2, nrow=2)
+```
+
+Figure 1 visualizes the distributions of broadband access and FMD, which count indicating the number of census tracts whose value for that variable falls into that interval. Red lines of the figures indicate the average value for each variable across all census tratcs. There are 9 CTs that are missing data on the percent of households with a high-speed internet connection and 7 CTs with missing data on percent of adults with frequent mental distress. 
+
+```{r scatter, fig.cap="Figure 2: Relationship between Broadband Connection and FMD within Boston Census Tracts"}
+p3 <- ggplot(aes(x=bb_est, y=fmd_est), data=df_bos) + geom_point() +
+  xlab("% Households with High-Speed Internet Connection") + 
+  ylab("% Adults with Frequent Mental Distress (Past month)") +
+  geom_smooth(method="lm") + theme_bw()
+p3
+```
+
+```{r lm}
+lm1 <- lm(fmd_est~bb_est, data=df_bos)
+#summary(lm1)
+```
+
+Figure 2 visualizes the correlation between broadband access and frequent mental distress which each point representing an individual census tract in Boston. The blue line represents the relationship between broadband access and FMD, with the gray shading representing uncertainty around the estimated relationship between the two variables. As visualized in Figure 2, broadband access is negatively association with FMD in Boston. Every 1% increase in households with a high-speed internet connection is associated with a 0.216% decrease of adults in a CT who experience FMD (correlation = `r round(cor(df_bos$bb_est, df_bos$fmd_est, use='complete.obs'), 3)`). In other words, CTs with more high-speed internet connections were observed to have lower levels of FMD among its residents. 
+
+```{r map, fig.cap = "Figure 3: Geographic Distributions"}
+library(tigris)
+tr <- tigris::tracts(state = "MA", county = "Suffolk")
+df_bos <- df_bos %>% left_join(mass %>% select(tract_code, stcotr_fips)) %>%
+  mutate(stcotr_fips = as.character(stcotr_fips))
+tr <- tr %>% filter(GEOID %in% df_bos$stcotr_fips) %>%
+  left_join(df_bos %>% select(bb_est, fmd_est, stcotr_fips),
+            by = c("GEOID" = "stcotr_fips"))
+bb_map <- ggplot(tr, aes(fill=bb_est)) + geom_sf() + theme_void() +
+  scale_fill_distiller(palette = "Oranges", direction = 1) + 
+  labs(title = "Broadband Access",
+       fill = "% Households")
+fmd_map <- ggplot(tr, aes(fill=fmd_est)) + geom_sf() + theme_void() +
+  scale_fill_distiller(palette = "Purples", direction = 1) + 
+  labs(title = "Frequent Mental Distress",
+       fill = "% Adults")
+
+ggarrange(bb_map, fmd_map)
+```
+
+Unfortunately, demographic insight into broadband access and frequent mental distress is not available on the City Health Dashboard so understanding the racial/ethnic distribution of these variables in Boston is not possible. However, this data does indicate that there are simultaneous census-tract level disparities in broadband access and FMD. This is visualized in Figure 4, where it is clear that the census tracts towards the center of Boston tend towards lighter orange (less broadband access) and darker purple (higher FMD).
+
+## Comparing Boston to other cities: Broadband Connection and FMD
+
+```{r city_df}
+df_city <- bb %>% left_join(fmd, by = c("city_name", "tract_code")) %>%
+  mutate(color = ifelse(city_name=="Boston", "highlight", "normal"))
+```
+
+```{r col_graph, fig.cap="Figure 4: Comparison of Massachusetts Cities"}
+p1 <- df_city %>% group_by(city_name, color) %>%
+  summarize(bb_avg=mean(bb_est, na.rm=T)) %>%
+  ggplot(aes(fct_reorder(city_name,bb_avg), bb_avg, fill=color)) +
+  geom_col(show.legend = FALSE) + theme_bw() + xlab("City") +
+  scale_fill_brewer(palette="Set1") + 
+  ylab("% Households Broadband Access") +
+  theme(axis.text.x = element_text(angle = 90))
+  
+p2 <- df_city %>% group_by(city_name, color) %>%
+  summarize(fmd_avg=mean(fmd_est, na.rm=T)) %>%
+  ggplot(aes(fct_reorder(city_name,fmd_avg), fmd_avg, fill=color)) +
+  geom_col(show.legend = FALSE) + theme_bw() + xlab("City") +
+  scale_fill_brewer(palette="Set1") + 
+  ylab("% Adults with FMD") +
+  theme(axis.text.x = element_text(angle = 90))
+
+p1
+```
+
+Figure 3 shows the average value for broadband access and FMD among cities in Massachusetts for which data is available on the City Health Dashboard, ordered from ascending to descending. Relative to other Massachusetts cities (available on City Health Dashboard), Boston falls around the 50th percentile of both broadband access and frequent mental distress (Figure 3).
+
+```{r corr, fig.cap="Figure 5: Relationship between Broadband Connection and FMD across Massachusetts"}
+df_city %>% group_by(city_name, color) %>%
+  summarize(corr = cor(bb_est, fmd_est, use="complete.obs")) %>%
+  ggplot(aes(fct_reorder(city_name,corr), corr, fill=color)) +
+  geom_col(show.legend = FALSE) + theme_bw() + xlab("City") +
+  scale_fill_brewer(palette="Set2") + 
+  ylab("Correlation Coefficient") +
+  theme(axis.text.x = element_text(angle = 90))
+```
+
+Figure 4 visualizes the strength of the correlation between broadband access and FMD within each city. The farther from 0, in either direction, indictes a stronger correlation and a negative value indicating a negative association and a positive value indicating a positive association. As evidenced by Figure 4, the association between broadband access and FMD is stronger in Boston relative to most other cities in Massachusetts. While preliminary evidence  that is not causal, this observation might suggest that efforts to improve broadband access might have show greater improvement in rates of frequent mental distress in Boston than in a city like Medford for example. 
+
