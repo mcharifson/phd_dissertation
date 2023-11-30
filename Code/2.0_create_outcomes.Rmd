@@ -37,7 +37,8 @@ tab3 %>%
   group_by(pat_id) %>%
   summarise(uf_dx_date=min(dx_date),
             # record the total number of UF Dx codes ever dropped in EHR
-            uf_dx_count=n())
+            uf_dx_count=n()) %>%
+  filter(uf_dx_date >= as.Date('2017-01-01')) ## need to replace with index encounter date
 ```
 
 ```{r uf_image}
@@ -68,7 +69,8 @@ tab3 %>%
   group_by(pat_id) %>%
   summarise(endo_dx_date=min(dx_date),
             # record the total number of Dx codes ever dropped in EHR
-            endo_dx_count=n())
+            endo_dx_count=n()) %>%
+  filter(endo_dx_date >= as.Date('2017-01-01')) ## need to replace with index encounter date
 ```
 
 ```{r endo_image}
