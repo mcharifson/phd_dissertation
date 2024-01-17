@@ -1,4 +1,5 @@
 -- query to grab address data but not save any PHI
+-- because its over 500000 rows, I split it into two ordering by date and grabbing top and then bottom
 
 select 
 pat_id
@@ -19,6 +20,9 @@ pat_id
 , accuracy_type
 , accuracy_score
 from sr3452058_table5_addr
+order by eff_start_date --desc
+limit 500000
+-- limit 300000
 
 
 

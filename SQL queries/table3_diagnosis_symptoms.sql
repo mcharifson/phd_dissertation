@@ -8,5 +8,7 @@ select *
 from sr3452058_table3_diagnosis
 where 
 lower(dx_name) not like '%pregnancy%' and
-regexp_like(icd10, 'N94.4|N94.5|N94.6|N93.8|N93.9|R10.2|F52.6|N94.1|N97.9|N92.0|N92.1|N93.0|N94.0|D50.0|N83.0|N83.2|N39.3|N32.9|K95.00|R19.7|M54.5')
-
+-- menstrual symptoms
+regexp_like(icd10, 'N94.4|N94.5|N94.6|N93.8|N93.9|N92.0|N92.1|N94.0|N83.0|N83.2|R10.2')
+-- all other symptoms
+--regexp_like(icd10, 'F52.6|N94.1|N97.9|N93.0|D50.0|N39.3|N32.9|K95.00|R19.7|M54.5')

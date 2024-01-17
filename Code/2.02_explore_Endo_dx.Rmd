@@ -1,0 +1,576 @@
+---
+title: 'Step 2.0: Outcome Creation'
+author: "Mia Charifson"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = '/Users/miacharifson/Library/CloudStorage/OneDrive-NYULangoneHealth/Charifson Dissertation/')
+```
+
+# 2.1. Derive outcome variables
+
+Goals of this document: - Using algorithm to assign diagnosis confidence to each case - Identify patients for whom we need to manually review notes
+
+```{r lib, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(lubridate)
+library(tableone)
+library(arsenal)
+library(readxl)
+library(ggpubr)
+library(corrplot)
+```
+
+```{r load}
+pat_cohort <- read.csv('Data/Derived/pat_cohort_w_censoring.csv') %>% select(-X)
+uf_endo <- read.csv('Data/Epic/table3_dx_uf_endo_adeno.csv')
+uf_endo_filled_dates <-read.csv('Data/Epic/table3_uf_endo_dx_date_filled.csv')
+imaging_dx <- read.csv('Data/Epic/table3_dx_imaging.csv') 
+imaging_orders <- read.csv('Data/Epic/table4_proc_imaging.csv') 
+surgery_orders <- read.csv('Data/Epic/table4_proc_surgery.csv') 
+surgery_records <- read.csv('Data/Epic/table4_surgery_surgical_dx.csv')
+```
+
+```{r}
+# Combine tables that need combining
+uf_endo_cohort <- uf_endo %>%
+  mutate(dx_date = strptime(dx_date, "%Y-%m-%d %H:%M:%S")) %>%
+  ## remove those missing a dx date
+  filter(!is.na(dx_date)) %>%
+  ## add in filled dx_date where missing
+  bind_rows(uf_endo_filled_dates %>% 
+              filter(!is.na(dx_date)) %>%
+              mutate(dx_date_filled = strptime(dx_date_filled, "%Y-%m-%d %H:%M:%S"),
+                     dx_date = strptime(dx_date, "%Y-%m-%d %H:%M:%S")) %>%
+              mutate(dx_date = case_when(is.na(dx_date)~dx_date_filled, TRUE~dx_date))) %>%
+  # fill in missing index_enc_date
+  inner_join(pat_cohort %>% select(pat_id, index_enc_date), by = 'pat_id')
+  
+## combine all imaging
+imaging_all <- imaging_dx %>%
+  mutate(imaging_date = strptime(dx_date, "%Y-%m-%d %H:%M:%S")) %>%
+  #mutate(pat_enc_csn_id = as.numeric(pat_enc_csn_id)) %>%
+  mutate(event_name = dx_name,
+         event_type = paste0('Imaging-', dx_type)) %>%
+  select(pat_id, imaging_date, event_name, event_type) %>%
+  bind_rows(imaging_orders %>% 
+              mutate(imaging_date = as.Date(ordering_date)) %>%
+              mutate(event_name = procedure_name,
+                     event_type = 'Imaging Order') %>%
+              select(pat_id, imaging_date, event_name, event_type)) %>%
+  filter(pat_id %in% pat_cohort$pat_id)
+
+## combine all surgery
+surgery_all <- surgery_records %>%
+  mutate(surgery_date = strptime(surgery_date, "%Y-%m-%d %H:%M:%S")) %>%
+  full_join(surgery_orders %>% mutate(surgery_date = as.Date(ordering_date)), 
+            by=c('pat_id', 'pat_enc_csn_id', 'surgery_date', 'procedure_name',
+                                 'procedure_code_type', 'procedure_code')) %>%
+  mutate(type = ifelse(!is.na(performed), 'Surgery record', 'Surgery order')) %>%
+  select(-ordering_date) %>%
+  filter(pat_id %in% pat_cohort$pat_id)
+```
+
+```{r, eval=FALSE}
+# there should be no UF/Endo diagnoses prior to their index enc
+length(which(uf_endo_cohort$dx_date[uf_endo_cohort$icd10 != 'N80.03'] < uf_endo_cohort$index_enc_date[uf_endo_cohort$icd10 != 'N80.03']))
+
+# look at these patients
+uf_endo_cohort %>%
+  filter(icd10 != 'N80.03' & dx_date <= index_enc_date) %>%
+  View()
+```
+
+## Endometriosis
+
+```{r endo_unique_dates}
+endo_dx_unique <- uf_endo_cohort %>% 
+  filter(grepl('N80', icd10) & !grepl('N80.03', icd10) & !grepl('adenomyosis', dx_name) & !is.na(dx_date)) %>%
+  rename(date=dx_date) %>%
+  select(-referral_id, -icd10, -dx_date_filled, -pat_enc_csn_id) %>%
+  group_by(pat_id, date) %>%
+  summarise(event_name = paste0(unique(dx_name), collapse=', '),
+            event_type = paste0(unique(dx_type), collapse=', '),
+            .groups='drop')
+
+imaging_unique <- imaging_all %>% 
+  filter(pat_id %in% endo_dx_unique$pat_id) %>%
+  mutate(date=as.Date(imaging_date)) %>%
+  group_by(pat_id, date)  %>%
+  summarise(event_name = paste0(unique(event_name), collapse=', '),
+            event_type = paste0(unique(event_type), collapse=', '),
+            .groups='drop')
+
+surgery_unique <- surgery_all %>% 
+  filter(pat_id %in% endo_dx_unique$pat_id) %>%
+  mutate(date = as.Date(surgery_date)) %>%
+  group_by(pat_id, date) %>%
+  summarise(event_name = paste0(unique(procedure_name), collapse=', '),
+            event_type = paste0(unique(type), collapse=', '),
+            .groups='drop')
+
+endo_all_long <- bind_rows(endo_dx_unique, imaging_unique, surgery_unique) %>%
+  distinct() %>%
+  arrange(pat_id, date)
+```
+
+```{r}
+n_endo_raw <- length(unique(endo_dx_unique$pat_id))
+```
+
+There are `r n_endo_raw` patients with any Endo ICD-10 code in their EHR during follow-up. Now I will double check these based on other information in their EHR to confirm they are true positives and incident cases (vs. prevalent cases).
+
+### First diagnosis information
+
+```{r endo_first_dx}
+endo_first_dx <- uf_endo_cohort %>% 
+  filter(grepl('N80', icd10) & !grepl('N80.03', icd10) & !grepl('adenomyosis', dx_name) & !is.na(dx_date)) %>%
+  group_by(pat_id) %>%
+  filter(dx_date==min(dx_date)) %>%
+  summarise(first_dx_date = mean(dx_date),
+            first_dx_type = paste0(unique(dx_type), collapse = ';'),
+            .groups='drop') %>%
+  left_join(pat_cohort %>% 
+              select(pat_id, index_enc_date, final_censor_date, final_censor_type, ltfu_status, ltfu_reengage_date)
+            , by="pat_id") %>%
+  mutate(time_to_first_dx = difftime(first_dx_date, index_enc_date, units="days"))
+```
+
+```{r endo_first_dx_plot}
+endo_first_dx %>%
+  group_by(first_dx_date) %>%
+  summarise(count=n(), .groups='drop') %>%
+  mutate(cumulative_count = cumsum(count)) %>%
+  ggplot(data=., aes(x=first_dx_date, y=cumulative_count)) +
+  geom_line() +
+  ylab('Cumulative Count of Patients Diagnosed with Endo') +
+  xlab('Date of Diagnosis') +
+  theme_bw()
+```
+
+```{r}
+endo_first_dx %>%
+  mutate(medical_hx = case_when(grepl('Medical History', first_dx_type)~TRUE, TRUE~FALSE),
+         encounter = case_when(grepl('Encounter Diagnosis', first_dx_type)~TRUE, TRUE~FALSE),
+         problem_list = case_when(grepl('Problem List', first_dx_type)~TRUE, TRUE~FALSE),
+         hospital_dx = case_when(grepl('Hospital Account Diagnosis', first_dx_type)~TRUE, TRUE~FALSE),
+         referral_dx = case_when(grepl('Referral Diagnosis', first_dx_type)~TRUE, TRUE~FALSE)) %>%
+CreateTableOne(data=., vars = c('referral_dx', 'encounter', 'medical_hx', 'problem_list', 'hospital_dx'))
+```
+The table above shows the relative frequency of each code type for the first ever Endo Dx code drop. These sum to more than 100% because patients can get one code type dropped on the same day as another (i.e. a referral Dx and an encounter Dx on the same day).
+
+```{r time_to_first_endo_dx_plot}
+endo_first_dx %>%
+  # only for those diagnosed under 6 months
+  ggplot(data=., aes(x=time_to_first_dx)) +
+  geom_histogram(fill='lavender', color='black', binwidth=30) +
+  xlab('Days between Index Encounter and First Endo Dx') +
+  theme_bw()
+```
+
+There are `r length(which(endo_first_dx$time_to_first_dx <= 180))` patients diagnosed in their first 6 months of follow-up.
+
+How many patients are censored prior to their first Endo diagnosis code?
+
+`r length(which(endo_first_dx$first_dx_date > endo_first_dx$final_censor_date))` patients are censored prior to their first Endo Dx code gets dropped.
+
+How are these patients censored?
+
+```{r}
+endo_first_dx %>%
+  filter(first_dx_date > final_censor_date) %>%
+  CreateTableOne(data=., vars='final_censor_type')
+```
+
+The majority of them are lost to follow-up (LTFU). Of those LFTU, how many of them re-engage?
+
+```{r}
+tab <- endo_first_dx %>%
+  filter(first_dx_date > final_censor_date & final_censor_type == 'LTFU') %>%
+  mutate(ltfu_status = factor(ltfu_status)) %>%
+  CreateTableOne(data=., vars='ltfu_status')
+
+print(tab, showAllLevels=TRUE)
+```
+Very few of these patients are completely LTFU. If this was coded correctly, they should re-engage prior to their first Endo diagnosis. Double checking this below...
+
+```{r}
+endo_first_dx %>%
+  filter(first_dx_date > final_censor_date & final_censor_type == 'LTFU' & ltfu_status=='partial') %>%
+  mutate(reengage_prior_to_dx = as.numeric(difftime(first_dx_date, ltfu_reengage_date, units='days'))) %>%
+  ggplot(data=., aes(x=reengage_prior_to_dx)) +
+  geom_histogram(fill='lightpink', color='black', binwidth=30) +
+  xlab("Days between First Endo Diagnosis date and Re-Engagement in relevant care") +
+  theme_bw()
+```
+
+The graphs above shows that some patients received their first Endo diagnosis sometime between the last known relevant care encounter prior to LTFU (2 years of no relevant care) and the next time they have relevant care (sometime greater than 2 years later). This would suggest these patients are still receiving SOME kind of care that allowed them to get a diagnosis code dropped but we do not consider this relevant care in our definition. 
+
+```{r}
+endo_first_dx %>%
+  filter(first_dx_date > final_censor_date & final_censor_type == 'LTFU') %>%
+  mutate(medical_hx = case_when(grepl('Medical History', first_dx_type)~TRUE, TRUE~FALSE),
+         encounter = case_when(grepl('Encounter Diagnosis', first_dx_type)~TRUE, TRUE~FALSE),
+         problem_list = case_when(grepl('Problem List', first_dx_type)~TRUE, TRUE~FALSE),
+         hospital_dx = case_when(grepl('Hospital Account Diagnosis', first_dx_type)~TRUE, TRUE~FALSE),
+         referral_dx = case_when(grepl('Referral Diagnosis', first_dx_type)~TRUE, TRUE~FALSE)) %>%
+  CreateTableOne(data=., vars = c('referral_dx', 'encounter', 'medical_hx', 'problem_list', 'hospital_dx'))
+```
+Many of these diagnoses that occur after complete or partial diagnoses are encounter diagnoses. About one-fourth are referral diagnoses which is expected and another fourth are medical history diagnoses which could once again be indicative of being diagnosed outside of NYU and indicating this new diagnosis upon return to care at NYU or at 'irrelevant' care at NYU.
+
+NEXT STEP: I should look into what kind of provider they are receiving this diagnosis from since they are clearly not included in the relevant provider specialties. 
+
+### Multiple diagnoses & count of referral diagnosis
+
+```{r endo_multiple_dx}
+endo_dx_count <- endo_all_long %>% 
+  mutate(referral_dx=ifelse(grepl('Referral Diagnosis', event_type), TRUE, FALSE),
+         medical_hx=ifelse(event_type == 'Medical History', TRUE, FALSE)) %>%
+  group_by(pat_id) %>%
+  summarise(dx_count = sum(grepl('Diagnosis|Problem|History', event_type)), 
+            referral_count = sum(referral_dx),
+            all_medical_hx = ifelse(n()==sum(medical_hx), TRUE, FALSE),
+            .groups='drop')
+```
+
+```{r endo_dx_count_plot}
+ggplot(data=endo_dx_count, aes(x=dx_count)) + 
+  geom_histogram(fill='lightblue', color='black', binwidth = 1) +
+  xlab('Number of Endo Dx per patient') +
+  theme_bw()
+```
+Most patients with Endo have very few diagnosis codes dropped. This is very different from UF. 
+
+### Only medical history codes (hint for prevalent case)
+
+```{r medical_hx_only_hint}
+# look for patients who ONLY ever have medical history code drops (no procedures)
+endo_only_medical_hx <- endo_all_long %>% 
+  group_by(pat_id) %>%
+  summarise(all_medical_hx = ifelse(n()==sum(event_type == 'Medical History'), TRUE, FALSE),
+            .groups='drop')
+```
+
+There are `r length(which(endo_only_medical_hx$all_medical_hx))` patients for whom the only indication for Endo in their EHR is via medical history codes (and no diagnostic procedures). There is a high likelihood these patients are prevalent cases who only had their health history added to their record after entry to cohort. 
+
+Assumption: if they were diagnosed outside NYU but during follow-up, they'd have a referral diagnosis code. 
+
+```{r medical_hx_age_plot}
+# are these patients generally older
+pat_cohort %>%
+  filter(pat_id %in% endo_only_medical_hx$pat_id[which(endo_only_medical_hx$all_medical_hx)]) %>%
+  ggplot(data=., aes(x=age_20160801)) +
+  geom_histogram(fill='lightyellow', color='black', binwidth=5) +
+  xlab('Age at basline') +
+  theme_bw()
+```
+
+Patients who only ever get Endo codes dropped as medical history (and never have any procedures) are predominantly older patients (above 35 years old). I will explore the younger patients but I think in general these patients should be considered prevalent cases and exclude from the analysis. 
+
+```{r}
+# look at younger patients in this subgroup
+endo_all_long %>% 
+  filter(pat_id %in% endo_only_medical_hx$pat_id[which(endo_only_medical_hx$all_medical_hx)]) %>%
+  # want to know if these are older patients
+  left_join(pat_cohort, by='pat_id') %>%
+  filter(age_20160801 < 35) %>%
+  View()
+```
+
+These are a bit tricky to discern right now. The question is: is there anyway an incident diagnosis of fibroids (at NYU or outside of NYU) would only ever receive a medical history code in their EHR?
+
+NEXT STEP: check if the FIRST encounter where the medical history code is dropped is their first visit to an NYU OBGYN provider -- i.e. maybe they entered NYU at start of cohort but the first time they ever get ASKED about a history of fibroids is at a later visit?
+
+### Diagnostic procedure hints
+
+```{r, warnings=FALSE}
+library(data.table)
+df <- endo_all_long
+setDT(df)
+# indexing which rows are procedures
+df$is_procedure <- grepl('Imaging|Surgery',df$event_type)
+# indexing which rows are dx (ignore imaging Dx for now)
+df$is_diagnosis <- grepl('Diagnosis|Problem|List|History',df$event_type) & !grepl('Imaging',df$event_type)
+# rearrange so if a procedure and dx happen on the same day the procedure goes first
+df <- arrange(df, pat_id, date, is_diagnosis, is_procedure)
+# get the index of the next row that is a dx when the row is a procedure
+df[,next_dx_index:=zoo::na.locf(NA^(!is_diagnosis)*.I, fromLast=T, na.rm=F)*NA^(!is_procedure), by=pat_id]
+# find time difference between the date of procedure and the next Dx date
+df <- df[,next_dx_time_interval:=difftime(date[next_dx_index], date, units="days")]
+df <- df[,next_dx_name:=event_name[next_dx_index]]
+df <- df[,next_dx_type:=event_type[next_dx_index]]
+# check this works
+#View(df)
+
+# which are on the same day
+length(which(df$next_dx_time_interval==0))
+```
+
+```{r}
+df2 <- as.data.frame(df) %>%
+  mutate(method = case_when(grepl('Surgery', event_type)~"Surgery",
+                            grepl('Imaging', event_type)~"Imaging",
+                            TRUE~NA))
+
+df2 %>%
+  filter(!is.na(next_dx_time_interval)) %>%
+  group_by(pat_id) %>%
+  filter(next_dx_time_interval == min(next_dx_time_interval, na.rm=TRUE)) %>%
+  # in the case that there are multiple procedures with same margin, take the earlier one
+  filter(date == min(date, na.rm=TRUE)) %>%
+  ungroup() %>%
+  ggplot(data=., aes(x=next_dx_time_interval/30, fill=method)) +
+  xlab('Shortest Time between Dx procedure and next Dx code (months)') +
+  geom_histogram(binwidth = 5) +
+  facet_wrap(~method, scales = 'free_y') +
+  theme_bw()
+```
+The graph shows the count for patients who have an Endo Dx, had any diagnostic procedure performed in their EHR, and had another Endo Dx code following that procedure. The earliest procedure with the shortest margin between procedure and Dx code are selected per patient. The vast majority have an imaging procedure performed and within one month another Dx code is dropped. For those with a surgical procedure chosen, they are also quickly followed with another Dx code.
+
+## Exploring different types of confident diagnosis
+
+```{r}
+confident_endo_dx <- endo_dx_unique %>%
+  distinct(pat_id) %>%
+  mutate(confident_dx = FALSE)
+```
+
+### They have any Dx code type dropped within 6 months of a diagnostic procedure
+
+```{r}
+# grab ids for those who have any procedure with another diagnosis code within
+ids <- unique(df2$pat_id[which(df2$next_dx_time_interval <= 180)])
+# change their status in dataframe and add type
+confident_endo_dx <- confident_endo_dx %>%
+  mutate(confident_dx = case_when(pat_id %in% ids~TRUE,
+                                  TRUE~confident_dx),
+         confirmed_via_procedure = case_when(pat_id %in% ids~TRUE,
+                                  TRUE~FALSE))
+```
+
+### They have location of the endometriosis or the name indicates a confident dx
+
+```{r}
+# location list
+location_names <- c('bladder', 'cervical', 'ovar', 'tub', 'perito', 'umbilic', 'uterus', 'of', 'in')
+
+# look at all dx_names
+endo_dx_names <- uf_endo_cohort %>%
+  filter(grepl('N80', icd10) & !grepl('N80.03', icd10) & !grepl('adenomyosis', dx_name)) %>%
+  group_by(dx_name, icd10) %>%
+  summarize(count=n(),
+            has_location=ifelse(grepl(paste0(location_names, collapse='|'), tolower(dx_name)), TRUE, FALSE),
+            .groups='drop') %>%
+  distinct()
+```
+
+```{r}
+# extract location of the Endo based on Dx name if that exists
+df2$location <- grepl(paste0(location_names, collapse='|'), tolower(df2$event_name))
+
+# grab patients who have any Endo diagnosis with a location
+# these could still be prevalent cases but we still assume these are true cases
+ids <- unique(df2$pat_id[which(df2$location)])
+```
+
+```{r}
+## add these to the confident_dx dataframe
+confident_endo_dx <- confident_endo_dx %>%
+  mutate(confident_dx = case_when(pat_id %in% ids~TRUE, 
+                                  TRUE~confident_dx),
+         location_of_fibroids = case_when(pat_id %in% ids~TRUE,
+                                  TRUE~FALSE))
+```
+
+## They have fibroids added to medical history/problem list after any diagnostic procedure
+
+We might assume that prior to surgery someone might have a clinical fibroid diagnosis (unspecified location or no imaging confirmed location), but then after surgery the fibroids are treated as a prevalent diagnosis
+
+```{r}
+# check out procedures followed by problem list/medical history drop
+ids <- unique(df$pat_id[which(grepl("Problem|History", df$event_type[df$next_dx_index]) & 
+                                df$next_dx_time_interval > 180)])
+```
+
+```{r}
+## add these to the confident_dx dataframe
+confident_endo_dx <- confident_endo_dx %>%
+  mutate(confident_dx = case_when(pat_id %in% ids~TRUE,
+                                  TRUE~confident_dx),
+         prevalent_dx_after_procedure = case_when(pat_id %in% ids~TRUE,
+                                  TRUE~FALSE))
+
+summary(confident_endo_dx)
+```
+
+## Add multiple referral diagnosis codes as to confident dx
+
+```{r, eval=FALSE}
+# grab ids
+ids <- endo_dx_count$pat_id[which(endo_dx_count$referral_count > 1)]
+
+# how many of these are already confident
+length(which(ids %in% confident_endo_dx$pat_id[which(confident_endo_dx$confident_dx)])) #all of them
+```
+
+## Add patients first diagnosed after re-engaging after partial LTFU
+
+```{r}
+# people diagnosed AFTER re-engaging in relevant care post-LTFU are likely incident cases
+ids <- df_not_confident$pat_id[which(df_not_confident$first_dx_date>=df_not_confident$ltfu_reengage_date)]
+
+# add to the confident_dx dataframe
+confident_endo_dx <- confident_endo_dx %>%
+  mutate(confident_dx = case_when(pat_id %in% ids~TRUE,
+                                  TRUE~confident_dx),
+         dx_after_partial_LTFU = case_when(pat_id %in% ids~TRUE,
+                                  TRUE~FALSE))
+
+summary(confident_endo_dx)
+```
+
+```{r, eval=FALSE}
+# look at them
+df2 %>% 
+  filter(pat_id %in% ids) %>% 
+  left_join(df_not_confident %>% 
+              select(pat_id, index_enc_date, first_dx_date, final_censor_date, ltfu_status, ltfu_reengage_date),
+            by='pat_id') %>%
+  select(pat_id, index_enc_date, first_dx_date, final_censor_date, 
+         ltfu_status, ltfu_reengage_date, date, event_name, event_type) %>%
+  arrange(pat_id, date) %>%
+  View()
+```
+
+It seems likely that almost all cases where the first endometriosis diagnosis after re-engagement following LTFU **are** incident cases.
+
+## Look at patients who have no confident diagnosis based on above
+
+```{r, eval=FALSE, include=FALSE}
+# look at those who are not confident Dx
+df2 %>% 
+  filter(pat_id %in% confident_endo_dx$pat_id[which(!confident_endo_dx$confident_dx)]) %>% 
+  View()
+```
+
+```{r}
+# grab IDs of patients who never get any procedure during follow-up
+ids <- confident_endo_dx$pat_id[which(!confident_endo_dx$confident_dx)]
+
+# grab characteristics from the procedure dataframe
+procedure_info <- df2 %>%
+  group_by(pat_id) %>%
+  summarise(
+    has_any_imaging=ifelse(sum(method=='Imaging', na.rm=TRUE)>=1, TRUE, FALSE),
+    has_any_surgery=ifelse(sum(method=='Surgery', na.rm=TRUE)>=1, TRUE, FALSE),
+    #has_any_location=ifelse(sum(location, na.rm=TRUE)>=1, TRUE, FALSE),
+    shortest_procedure_dx_margin = ifelse((all(is.na(next_dx_time_interval))), NA, 
+                                          min(next_dx_time_interval, na.rm = TRUE)), 
+    .groups='drop')
+ 
+# join together this and other information on these patients 
+df_not_confident <- endo_first_dx %>%
+  left_join(endo_dx_count, by='pat_id') %>%
+  left_join(procedure_info, by='pat_id') %>%
+  filter(pat_id %in% ids) %>%
+  mutate(time_to_first_dx=as.numeric(time_to_first_dx),
+         shortest_procedure_dx_margin=as.numeric(shortest_procedure_dx_margin),) %>%
+  mutate(dx_early_into_FU = ifelse(time_to_first_dx <= 180, TRUE, FALSE))
+
+# look at overall characteristics
+tab_not_confident <- CreateTableOne(data=df_not_confident, 
+                                    vars=c("dx_early_into_FU", "dx_count", "referral_count", "all_medical_hx",
+                                           "has_any_surgery", "has_any_imaging",
+                                           "shortest_procedure_dx_margin"))
+
+print(tab_not_confident, 
+      nonnormal=c("dx_count", "referral_count", "shortest_procedure_dx_margin"), 
+      showAllLevels = TRUE)
+```
+
+About one third of these are medical history diagnoses only which might indicate prevalent cases, but not many are early into 
+
+## Look at those with any referral diagnosis in their history
+
+```{r}
+## look at all people with referral dx who aren't confident
+summary(df_not_confident$referral_count)
+
+## how many dx codes do they have in general
+summary(df_not_confident$dx_count[which(df_not_confident$referral_count > 1)])
+
+# how many people have more than one referral diagnosis
+length(unique(df_not_confident$pat_id[which(df_not_confident$referral_count > 1)])) #118
+# I am pretty confident that those with multiple referral codes & multiple diagnosis codes are true Dx
+# I will explore those with less dx codes
+
+## look at these people who have less diagnosis counts overall
+df2 %>%
+  filter(pat_id %in% df_not_confident$pat_id[which(df_not_confident$referral_count>1 &
+                                                     df_not_confident$dx_count < 5)]) %>%
+  View()
+```
+
+## Look at time to first dx for all medical hx cases
+
+```{r}
+summary(df_not_confident$time_to_first_dx[which(df_not_confident$all_medical_hx)])
+```
+
+Some of these cases are definitely prevalent as indicated by short times to first diagnosis after entering the cohort. We will need to choose a threshold around these cases. Proposal for 6 months. 
+
+The next step is look into whether these remaining not confident cases are censored and therefore, likely to have recieved an external diagnosis and treatment, explaining the paucity of their diagnosis information in the NYU EHR. 
+
+## Look at censoring date and first diagnosis date for these non-confident cases
+
+```{r}
+df_not_confident %>%
+  mutate(censored_before_dx = ifelse(first_dx_date >= final_censor_date, TRUE, FALSE)) %>%
+  CreateTableOne(data=., var=c('final_censor_type', 'censored_before_dx', 'ltfu_status'), includeNA=TRUE)
+```
+About half of non-confident cases experience some form of censoring and about 25% of these cases are diagnosed after censoring occurred. This could likely indicate more usage of other healthcare systems in which an incident Endo dx occurred and then was at some point communicated back to NYU. 
+
+```{r}
+# look at those diagnosed after LTFU censoring
+df2 %>% 
+  filter(pat_id %in% df_not_confident$pat_id[which(df_not_confident$final_censor_type == 'LTFU')]) %>% 
+  left_join(df_not_confident %>% 
+              select(pat_id, index_enc_date, first_dx_date, final_censor_date, ltfu_status, ltfu_reengage_date),
+            by='pat_id') %>%
+  select(pat_id, index_enc_date, first_dx_date, final_censor_date, 
+         ltfu_status, ltfu_reengage_date, date, event_name, event_type) %>%
+  arrange(pat_id, date) %>%
+  View()
+```
+
+Those who age out or experience menopause might be more likely to be prevalent cases -- check if they are fall into the all medical history diagnosis category. 
+
+```{r}
+# look at censoring among those with all medical history codes
+df_not_confident %>%
+  filter(all_medical_hx) %>%
+  mutate(censored_before_dx = ifelse(first_dx_date >= final_censor_date, TRUE, FALSE)) %>%
+  CreateTableOne(data=., var=c('final_censor_type', 'censored_before_dx'), includeNA=TRUE)
+```
+Surprisingly, the majority of the non-confident cases with only medical history diagnoses are not predominantly aged out or menopause censored. In fact, many are never censored. 
+
+```{r}
+# look at them
+df_not_confident %>% filter(all_medical_hx==TRUE) %>% View()
+```
+
+From reviewing the all medical history non-confident cases, it appears to me that many of them are likely patients who predominantly receive their Endo diagnosis and treatment outside NYU. About 1/4 of these patients 
+
+Finally, those who are censored via surgery may be true cases referred in for surgery with little diagnosis information in NYU EHR -- also look into these. 
+
+```{r}
+# look into those censored due to surgery
+```
+
+
+
+

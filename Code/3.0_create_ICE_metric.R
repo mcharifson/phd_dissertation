@@ -1,82 +1,138 @@
 # 10/31/2023
 # Author: Mia Charifson, adapted by code from Teresa Herrera
-# Script Description: R code for generating the number of total women of reproductive age (15-44 yo) 
-# for each state for each year between 2010-2021 for the project looking at acute climate events and 
-# fertility rates. 
+# Script Description: R code for generating the ICE-RI for census tracts in NYC
+# for each year between 2016-2023 for chapter one of my dissertation.
 # Please note part of this code was built off of the public health geocoding project https://www.hsph.harvard.edu/thegeocodingproject/covid-19-resources/
 
-# load packages
+## The document follows the following steps: 
 
+## 1: generate ICE value for all NY census tracts for 2016-2022
+## 2: link this to the residential history table
+## 3: link gentrification index to the above
+
+# load packages
 library(tidyverse)
 library(tidycensus)
 library(sf)
 library(tigris)
 library(lubridate)
+library(ggsflabel)
+library(scales)
+library(readxl)
+
+###################################################################################
+## STEP 1: generate ICE value for all NY census tracts for 2016-2022 ##############
+###################################################################################
 
 # set options
-
 options(tigris_use_cache = TRUE)
-
+ 
 # add tidycensus API key to securely load in census data
+census_api_key("3ef931e71aefa00abd570dcc13b0b144347e3c3d", overwrite = TRUE, install=TRUE)
+readRenviron("~/.Renviron")
 
-census_api_key("76346286dbe229b606299e9e6d31e0eda25a95d6", overwrite = TRUE)
+# # you can get an API Key here:
+# # https://api.census.gov/data/key_signup.html
 
-# you can get an API Key here:
-# https://api.census.gov/data/key_signup.html
+# check the variable names
+census_vars <- load_variables(2016, "acs5", cache = TRUE)
+census_vars %>% filter(str_detect(name, 'B19001')) %>% View() 
+census_vars %>% filter(str_detect(name, 'B19001B'))
 
-### name states of interest
-my_states <- c("NY")
-
-# generate list of variables according this data dictionary
-# https://www.socialexplorer.com/data/ACS2016_5yr/metadata/?ds=ACS16_5yr&table=B01001
-my_vars <- c('B19001A_014', 'B19001A_015', 'B19001A_016', 'B19001A_017', 'B19001B_002',
-             'B19001B_003E', 'B19001B_004', 'B19001B_005', 'B19001_001')
-
-# call all years from 2009-2019
+# define years using purrr::lst to automatically creates a named list
+# which will help later when we combine the results in a single tibble
 years <- lst(2016, 2017, 2018, 2019, 2020, 2021, 2022)
 
-# perform multi-year call
-multi_year <-
-  map(
-    years,
-    ~ get_acs(
-      geography = "tract",
-      state = my_states,
-      variables = my_vars,
-      year = .x,
-      survey='acs5',
-      geometry = FALSE)) %>%
-  map2(years, ~ mutate(.x, id = .y))
+# which census variables?
+my_vars <- c(
+  total_white_hh='B19001A_001', 
+  white100_125='B19001A_014', 
+  white125_150='B19001A_015', 
+  white150_200='B19001A_016', 
+  white_above200='B19001A_017', 
+  black_less10='B19001B_002',
+  black10_15='B19001B_003', 
+  black15_20='B19001B_004', 
+  black20_25='B19001B_005', 
+  total_black_hh='B19001B_001'
+)
 
-# combine into single dataframe
-all_years <- reduce(multi_year, rbind)
+# loop over list of years and get 1 year acs estimates
+nyc_multi_year <- map_dfr(
+  years,
+  ~ get_acs(
+    geography = "tract",
+    variables = my_vars,
+    state = "NY",
+    year = .x,
+    survey = "acs5",
+    geometry = FALSE), 
+  .id = "year") %>%
+  select(-moe) %>%
+  arrange(variable, NAME)
 
-# summarise by state and year and then repeat for each month
-df <- all_years %>%
-  group_by(NAME, id) %>%
-  summarise(Total_WRA_Pop = sum(estimate), .groups='drop') %>%
-  rename(State = NAME, Year = id)
+# pivot by tract and year and then summarise
+nyc_multi_year_wide <- nyc_multi_year %>% 
+  pivot_wider(
+    id_cols=c(year, GEOID, NAME),
+    names_from=variable,
+    values_from=estimate
+  ) %>%
+  mutate(
+    A = white100_125+white125_150+white150_200+white_above200,
+    P = black_less10+black10_15+black15_20+black20_25,
+    T = total_white_hh + total_black_hh,
+    ICE_RI = (A-P)/T
+  )
 
-##here we only select the variables we need for the merge, here those are the GEOID, B19001_001E = total population per tract
-# variables B19001A_014E through B19001A_017E are the number of white households with incomes greater than or equal to $100,000 per year in a tract (this represents the privileged group in the ICE metric)
-# variables B19001B_002E through B19001B_005E are the number of Black households with incomes less than or equal to $24,999 per year in a tract (this represents the less privileged group)
-race.inc <- merge %>%
-  ## create more privileged group
-  mutate(above80.white = B19001A_014E + B19001A_015E + B19001A_016E + B19001A_017E) %>%
-  ## create less privileged group
-  mutate(below20.black = B19001B_002E + B19001B_003E + B19001B_004E + B19001B_005E) %>%
-  ## total for the tract
-  rename(total.n = B19001_001E) %>%
-  select(GEOID, above80.white, below20.black, total.n)
+# there are some CTs for whom there is a 0 in every value
+# this seems unlikely so if rowSum = 0, then set to NA???
 
-race.inc <- race.inc %>% 
-  mutate(ICEwbinc=(above80.white-below20.black)/total.n) # this creates the ice metric 
+# look at overall distribution by year
+nyc_multi_year_wide %>%
+  ggplot(data=., aes(x=ICE_RI)) +
+  geom_histogram(fill='purple', color='black', binwidth=0.1) +
+  facet_wrap(~year) +
+  theme_bw()
 
-hist(race.inc$ICEwbinc)
+# write out data
+write.csv(nyc_multi_year_wide, "Data/External/ACS_ICE_RI_2016_2022.csv")
 
-write.csv(df, "../Data/wra_2009-2021.csv")
+# to plot the data
+# loop over year list and get acs estimates with sf geometry
+nyc_multi_year_list <- map(
+  years,
+  ~ get_acs(
+    geography = "tract",
+    variables = my_vars,
+    state = "NY",
+    year = .x,
+    survey = "acs5",
+    geometry = TRUE,
+    cb = TRUE
+  ),
+) %>%
+  map2(years, ~ mutate(.x, year = .y))  # add year as id variable
+
+nyc_all_geo <- reduce(nyc_multi_year_list, rbind)
+
+# write out data
+save(nyc_all_geo, file = "Data/External/ACS_ICE_RI_2016_2022_w_geography.RData")
+
+###################################################################################
+## STEP 2: link this to the residential history table #############################
+###################################################################################
+
+pat_cohort <- read.csv('Data/Derived/pat_cohort_w_censoring.csv')
+res_his <- read.csv('Data/Derived/baseline_cohort_address.csv')
 
 
+###################################################################################
+## STEP 3: link gentrification index to the above #################################
+###################################################################################
+
+gent_index <- read_excel('Data/External/gentrification_index/NYC_Gentrification_2000_16.xlsx', 1)
+gent_index_sub <- gent_index %>% select(tractid, nta_name, scores_raw)
 
 
 
