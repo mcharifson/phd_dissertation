@@ -360,6 +360,22 @@ ltfu_unique %>%
 
 NOTE: this includes all patients regardless of other censoring and case diagnosis. A more accurate summary of LTFU will be at the end of the document. 
 
+```{r}
+# time between initial LTFU and re-engage date for partial LTFU
+ltfu_unique %>%
+  filter(ltfu_status=='partial') %>%
+  mutate(time_to_reengage = as.numeric(difftime(ltfu_reengage_date, ltfu_date, units='day'))) %>%
+  #summary()
+  ggplot(data=., aes(x=time_to_reengage)) +
+  geom_histogram(bins=60, fill='gray', color='black') +
+  geom_vline(xintercept=730, color='orange') +
+  geom_vline(xintercept=1095, color='red') +
+  xlab('Time from initial LTFU to next relevant care encounter') +
+  ylab('Count of patients') +
+  theme_bw()
+```
+The orange line indicates two years (the mininum time to be considered partial LTFU). The red line indicates three years since last relevant care encounter. The median time to next relevant care encounter is 2.65 years and the first quartile is 2.26 years. 
+
 ## 1.3. Censoring not due to diagnosis of UF or Endo
 
 ### Death

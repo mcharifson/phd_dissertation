@@ -243,11 +243,11 @@ uf_first_dx %>%
          problem_list = case_when(grepl('Problem List', first_dx_type)~TRUE, TRUE~FALSE),
          hospital_dx = case_when(grepl('Hospital Account Diagnosis', first_dx_type)~TRUE, TRUE~FALSE),
          referral_dx = case_when(grepl('Referral Diagnosis', first_dx_type)~TRUE, TRUE~FALSE)) %>%
-  CreateTableOne(data=., vars = c('referral_dx', 'encounter', 'medical_hx', 'problem_list', 'hospital_dx'))
+  CreateTableOne(data=., test=FALSE,
+                 strata = 'ltfu_status', 
+                 vars = c('referral_dx', 'encounter', 'medical_hx', 'problem_list', 'hospital_dx'))
 ```
 Many of these diagnoses that occur after complete or partial diagnoses are encounter diagnoses. About one-fourth are referral diagnoses which is expected and another fourth are medical history diagnoses which could once again be indicative of being diagnosed outside of NYU and indicating this new diagnosis upon return to care at NYU or at 'irrelevant' care at NYU.
-
-NEXT STEP: I should look into what kind of provider they are receiving this diagnosis from since they are clearly not included in the relevant provider specialties. 
 
 ### Multiple diagnoses & count of referral diagnosis
 
@@ -268,6 +268,45 @@ ggplot(data=uf_dx_count, aes(x=dx_count)) +
   xlab('Number of UF Dx per patient') +
   theme_bw()
 ```
+
+`r length(which(uf_dx_count$dx_count == 1))` cases have only 1 UF diagnosis code in their records.
+This is `r round(length(which(uf_dx_count$dx_count == 1))/n_uf_raw, 2)*100`% of UF patients. Some of these may be confirmed below via other hints.
+
+```{r}
+uf_all_long %>%
+  filter(pat_id %in% uf_dx_count$pat_id[which(uf_dx_count$dx_count == 1)]) %>%
+  filter(grepl('Diagnosis|History|Problem', event_type)) %>%
+  mutate(medical_hx = case_when(grepl('Medical History', event_type)~TRUE, TRUE~FALSE),
+         encounter = case_when(grepl('Encounter Diagnosis', event_type)~TRUE, TRUE~FALSE),
+         problem_list = case_when(grepl('Problem List', event_type)~TRUE, TRUE~FALSE),
+         hospital_dx = case_when(grepl('Hospital Account Diagnosis', event_type)~TRUE, TRUE~FALSE),
+         referral_dx = case_when(grepl('Referral Diagnosis', event_type)~TRUE, TRUE~FALSE)) %>%
+  CreateTableOne(data=., test=FALSE,
+                 vars = c('referral_dx', 'encounter', 'medical_hx', 'problem_list', 'hospital_dx'))
+```
+Of those with only 1 UF diagnosis code, most are encounter diagnoses and not medical history diagnoses which is promising. The 277 patients with only one diagnosis code, that is a medical history, are going to be difficult to place and may be prevalent cases. 
+
+```{r}
+tab <- uf_first_dx %>%
+  filter(pat_id %in% uf_dx_count$pat_id[which(uf_dx_count$dx_count == 1)]) %>%
+  filter(first_dx_date > final_censor_date & final_censor_type == 'LTFU') %>%
+  mutate(ltfu_status = factor(ltfu_status)) %>%
+  CreateTableOne(data=., vars='ltfu_status')
+
+print(tab, showAllLevels=TRUE)
+```
+Most patients with only one UF dx who are also are diagnosed after LTFU are partially LTFU (they are likely these medical history diagnosis after re-engage patients).
+
+```{r}
+tab <- uf_first_dx %>%
+  left_join(uf_dx_count, by='pat_id') %>%
+  filter(first_dx_date > final_censor_date & ltfu_status == 'complete') %>%
+  mutate(dx_count = factor(dx_count)) %>%
+  CreateTableOne(data=., vars=c('dx_count', 'first_dx_type'), test=FALSE)
+
+print(tab, showAllLevels=TRUE)
+```
+For complete LTFU patients diagnosed after censoring, most of them only have one diagnosis code. They are also predominantly encounter/referral diagnoses and hospital account diagnoses. Some are medical history diagnoses as well. 
 
 ### Only medical history codes (hint for prevalent case)
 
@@ -295,7 +334,7 @@ pat_cohort %>%
 
 Patients who only ever get UF codes dropped as medical history (and never have any procedures) are predominantly older patients (above 35 years old). I will explore the younger patients but I think in general these patients should be considered prevalent cases and exclude from the analysis. 
 
-```{r}
+```{r, eval=FALSE}
 # look at younger patients in this subgroup
 uf_all_long %>% 
   filter(pat_id %in% uf_only_medical_hx$pat_id[which(uf_only_medical_hx$all_medical_hx)]) %>%
@@ -307,7 +346,17 @@ uf_all_long %>%
 
 These are a bit tricky to discern right now. The question is: is there anyway an incident diagnosis of fibroids (at NYU or outside of NYU) would only ever receive a medical history code in their EHR?
 
-NEXT STEP: check if the FIRST encounter where the medical history code is dropped is their first visit to an NYU OBGYN provider -- i.e. maybe they entered NYU at start of cohort but the first time they ever get ASKED about a history of fibroids is at a later visit?
+```{r}
+# time to first dx for all medical history cases
+uf_first_dx %>%
+  filter(pat_id %in% unique(uf_only_medical_hx$pat_id[which(uf_only_medical_hx$all_medical_hx)])) %>%
+  ggplot(data=., aes(x=as.numeric(time_to_first_dx))) +
+  geom_histogram(fill='lavender', color='black', binwidth=30) +
+  xlab('Days between Index Encounter and First UF Dx') +
+  geom_vline(xintercept = 365, color='orange') +
+  theme_bw()
+```
+Some of these patients are surely prevalent UF cases based on the early time to first diagnosis, but there is a wide distribution as to the timing of the first diagnoses which implies that some are incident cases that for some reason only get dropped as medical history diagnoses from the start. Assumption: these represent cases diagnosed outside of NYU and then come to NYU after treatment/diagnosis. 
 
 ### Diagnostic procedure hints
 
@@ -385,13 +434,15 @@ df2$location <- grepl('intramural|subserous|submucosal|subserosal|submucous', to
 # grab patients who have any UF diagnosis with a location
 # these could still be prevalent cases but we still assume these are true cases
 ids <- unique(df2$pat_id[which(df2$location)])
+```
 
+```{r, eval=FALSE}
 ## location is a strong indicator of confirmed UF since we ASSUME location was ascertained through imaging at NYU or outside of NYU (referral)
 df2 %>% filter(pat_id %in% ids) %>% View()
 
 ## look at whos leftover
 df2 %>% 
-  filter(!pat_id %in% ids & pat_id %in% confident_uf_dx$pat_id[which(!confident_uf_dx$confident_dx)]) %>% 
+  filter(!pat_id %in% ids & pat_id %in% confident_uf_dx$pat_id[which(!confident_uf_dx$confident_dx)]) %>%
   group_by(pat_id) %>% 
   filter(sum(location)>=1) %>%
   View()
@@ -412,7 +463,7 @@ We might assume that prior to surgery someone might have a clinical fibroid diag
 
 ```{r, eval=FALSE, include=FALSE}
 # example of patient with no confirmatory surgery (no Dx closely following surgery/imaging)
-uf_all_long %>% filter(pat_id == 'Z2405366') %>% View()
+#uf_all_long %>% filter(pat_id == 'Z2405366') %>% View()
 
 # they have multiple Dx codes (unspecific location -- so clinical)
 # then they have imaging/surgery
@@ -422,7 +473,7 @@ uf_all_long %>% filter(pat_id == 'Z2405366') %>% View()
 length(which(grepl("Problem|History", df$next_dx_type) & grepl("Surgery", df$event_type) & 
                df$next_dx_time_interval > 180))
 ids <- unique(df$pat_id[which(grepl("Problem|History", df$event_type[df$next_dx_index]) & df$next_dx_time_interval > 180)])
-df2 %>% filter(pat_id %in% ids) %>% View()
+#df2 %>% filter(pat_id %in% ids) %>% View()
 ```
 
 ```{r}
@@ -433,13 +484,13 @@ confident_uf_dx <- confident_uf_dx %>%
          prevalent_dx_after_procedure = case_when(pat_id %in% ids~TRUE,
                                   TRUE~FALSE))
 
-summary(confident_uf_dx)
+#summary(confident_uf_dx)
 ```
 ## They are diagnosed with uterine fibroids during pregnancy. 
 
 Shilpi confirmed that most of these are likely incidental fibroid diagnoses resulting from imaging related to pregnancy. Therefore many of these cases may be asymptomatic but are true incidental cases nonetheless. Only count when they are not a 'medical history' diagnosis as this might refer to a prior pregnancy. 
 
-```{r}
+```{r, eval=FALSE}
 # how many of these are pregnancy diagnoses
 df2 %>% 
   filter(pat_id %in% confident_uf_dx$pat_id[which(!confident_uf_dx$confident_dx)]) %>% 
@@ -470,7 +521,7 @@ confident_uf_dx <- confident_uf_dx %>%
          pregnancy_uf_dx = case_when(pat_id %in% ids~TRUE,
                                   TRUE~FALSE))
 
-summary(confident_uf_dx)
+#summary(confident_uf_dx)
 ```
 ## Add multiple referral diagnosis codes as to confident dx
 
@@ -484,7 +535,7 @@ confident_uf_dx <- confident_uf_dx %>%
          multiple_referral_dx = case_when(pat_id %in% ids~TRUE,
                                   TRUE~FALSE))
 
-summary(confident_uf_dx)
+#summary(confident_uf_dx)
 ```
 
 ## Look at non-confident diagnoses

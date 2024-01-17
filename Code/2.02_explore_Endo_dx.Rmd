@@ -243,7 +243,8 @@ ggplot(data=endo_dx_count, aes(x=dx_count)) +
   xlab('Number of Endo Dx per patient') +
   theme_bw()
 ```
-Most patients with Endo have very few diagnosis codes dropped. This is very different from UF. 
+`r length(which(endo_dx_count$dx_count == 1))` cases have only 1 Endo diagnosis code in their records.
+This is `r round(length(which(endo_dx_count$dx_count == 1))/n_endo_raw, 2)*100`% of Endo patients. Some of these may be confirmed below via other hints.
 
 ### Only medical history codes (hint for prevalent case)
 
@@ -271,7 +272,7 @@ pat_cohort %>%
 
 Patients who only ever get Endo codes dropped as medical history (and never have any procedures) are predominantly older patients (above 35 years old). I will explore the younger patients but I think in general these patients should be considered prevalent cases and exclude from the analysis. 
 
-```{r}
+```{r, eval=FALSE}
 # look at younger patients in this subgroup
 endo_all_long %>% 
   filter(pat_id %in% endo_only_medical_hx$pat_id[which(endo_only_medical_hx$all_medical_hx)]) %>%
@@ -363,7 +364,8 @@ endo_dx_names <- uf_endo_cohort %>%
   filter(grepl('N80', icd10) & !grepl('N80.03', icd10) & !grepl('adenomyosis', dx_name)) %>%
   group_by(dx_name, icd10) %>%
   summarize(count=n(),
-            has_location=ifelse(grepl(paste0(location_names, collapse='|'), tolower(dx_name)), TRUE, FALSE),
+            has_location=ifelse(grepl(paste0(location_names, collapse='|'), tolower(dx_name)), 
+                                TRUE, FALSE),
             .groups='drop') %>%
   distinct()
 ```
@@ -404,7 +406,7 @@ confident_endo_dx <- confident_endo_dx %>%
          prevalent_dx_after_procedure = case_when(pat_id %in% ids~TRUE,
                                   TRUE~FALSE))
 
-summary(confident_endo_dx)
+#summary(confident_endo_dx)
 ```
 
 ## Add multiple referral diagnosis codes as to confident dx
@@ -421,7 +423,7 @@ length(which(ids %in% confident_endo_dx$pat_id[which(confident_endo_dx$confident
 
 ```{r}
 # people diagnosed AFTER re-engaging in relevant care post-LTFU are likely incident cases
-ids <- df_not_confident$pat_id[which(df_not_confident$first_dx_date>=df_not_confident$ltfu_reengage_date)]
+ids <- endo_first_dx$pat_id[which(endo_first_dx$first_dx_date>=endo_first_dx$ltfu_reengage_date)]
 
 # add to the confident_dx dataframe
 confident_endo_dx <- confident_endo_dx %>%

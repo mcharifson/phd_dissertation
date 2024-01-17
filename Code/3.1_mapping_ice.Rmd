@@ -27,8 +27,8 @@ library(readxl)
 ```
 
 ```{r load}
-pat_cohort <- read.csv('Data/Derived/pat_cohort_w_censoring.csv')
-res_his <- read.csv('Data/Derived/baseline_cohort_addresses.csv')
+pat_cohort <- read.csv('Data/Derived/pat_cohort_w_censoring.csv') %>% select(-X)
+res_his <- read.csv('Data/Derived/baseline_cohort_addresses.csv') %>% select(-X)
 gent_index <- read_excel('Data/External/gentrification_index/NYC_Gentrification_2000_16.xlsx', 1)
 load("Data/External/ACS_ICE_RI_2016_2022_w_geography.RData")
 ```
@@ -50,8 +50,14 @@ nyc_geo2017 <- nyc_all_geo %>%
     ICE_RI = (A-P)/T
   )
 
+# remove non-NYC patients from the cohort
+res_his_nyc <- res_his %>%
+  filter(baseline_addr) %>%
+  filter(substr(full_fips_tract_final, 1, 5) %in% c(36005, 36047, 36061, 36081, 36085))
+  
+
 # join all together
-df <- nyc_geo_2017
+df <- nyc_geo_2017 %>%
 ```
 
 ## New York City Census Tract Geography
