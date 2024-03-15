@@ -15,16 +15,19 @@ library(readxl)
 library(data.table)
 
 # load files
-pat_cohort <- read.csv('Data/Derived/pat_cohort_w_censoring.csv') %>% select(-X)
+pat_cohort <- read.csv('Data/Derived/pat_cohort_w_censoring.csv') 
+nyc_counties <- read_excel('Data/External/NY_NJ_PA_CT_county_fips.xlsx', 1)
 res_his1 <- read.csv('Data/Epic/table5_addr_top.csv')
 res_his2 <- read.csv('Data/Epic/table5_addr_bottom.csv')
 
 # join together the files 
 res_his <- bind_rows(res_his1, res_his2) %>% distinct()
-length(which(!pat_cohort$pat_id %in% res_his$pat_id)) # 4 patients have no address data
+length(which(!pat_cohort$pat_id %in% res_his$pat_id)) # 3 patients have no address data
 
 # subset to patients in the cohort
-res_his <- res_his %>% filter(pat_id %in% pat_cohort$pat_id) %>% arrange(pat_id, eff_start_date, eff_end_date)
+res_his <- res_his %>% 
+  filter(pat_id %in% pat_cohort$pat_id) %>% 
+  arrange(pat_id, eff_start_date, eff_end_date)
 length(unique(res_his$pat_id)) # here we see the 4 patients with no address data
 
 # select the correct GEOID for the year of the address
@@ -38,7 +41,6 @@ res_his <- res_his %>%
   select(pat_id, geo_addr_id, eff_start_date, eff_end_date, census_tract_final, 
          full_fips_tract_final, source, accuracy_type, accuracy_score)
   
-
 # collapse the same address across multiple dates
 res_his_unique <- data.table(res_his)
 # remove rows that start and end on the same day (these seem to be errors)
@@ -49,32 +51,37 @@ res_his_unique$addr_group <- rep(1:length(z$lengths),z$lengths)
 # summarise info for a given address group
 res_his_unique <- res_his_unique[, .(eff_start_date_min = min(as.Date(eff_start_date)), 
                                      eff_end_date_max = max(as.Date(eff_end_date)),
-                                     mean_accuracy_score = mean(as.numeric(accuracy_score))), 
+                                     max_accuracy_score = max(as.numeric(accuracy_score))), 
                                  by = .(pat_id, census_tract_final, full_fips_tract_final, addr_group)]
 head(res_his_unique)
-summary(res_his_unique$mean_accuracy_score)
-length(which(res_his_unique$mean_accuracy_score < 0.8))/dim(res_his_unique)[1] #5% are low accuracy
+summary(res_his_unique$max_accuracy_score)
+length(which(res_his_unique$max_accuracy_score < 0.8))/dim(res_his_unique)[1] #5% are low accuracy
 length(unique(res_his_unique$pat_id))
 
-write.csv(res_his_unique, 'Data/Derived/all_cohort_addresses.csv')
+write.csv(res_his_unique, 'Data/Derived/all_cohort_addresses.csv', row.names=FALSE)
+#res_his_unique <- read.csv('Data/Derived/all_cohort_addresses.csv')
 
 ## explore the distribution of census tracts
 table(substr(res_his_unique$full_fips_tract_final, 1, 2))
 # the most populous are NY, NJ, PA, CT and to a lesser extent CA, MA, MD, DC and GA
-length(which(substr(res_his_unique$full_fips_tract_final, 1, 2)!=36))
-length(unique(res_his_unique$pat_id[which(substr(res_his_unique$full_fips_tract_final, 1, 2)!=36)]))
+length(which(!substr(res_his_unique$full_fips_tract_final, 1, 2) %in% c(36, 34, 09, 42)))
+length(unique(res_his_unique$pat_id[which(!substr(res_his_unique$full_fips_tract_final, 1, 2) %in% c(36, 34, 09, 42))]))
 # look at only NYC counties
-nyc_counties <- c(36005, 36047, 36061, 36081, 36085)
 table(substr(res_his_unique$full_fips_tract_final, 1, 5))
 # filter to only those with a nyc county fips
-length(unique(res_his_unique$pat_id[which(substr(res_his_unique$full_fips_tract_final, 1, 5) %in% nyc_counties)]))
-# 84979 patients
+length(unique(res_his_unique$pat_id[which(substr(res_his_unique$full_fips_tract_final, 1, 5) %in% nyc_counties$`State County fips`)]))
+# 101969 patients
 
 ################################################################################
 # Look for baseline address #####################################################
 ################################################################################
 
 res_his_unique <- left_join(res_his_unique, pat_cohort[c("pat_id", "index_enc_date")], by="pat_id")
+# how many patients have an address prior to their index encounter
+length(unique(res_his_unique$pat_id[which(res_his_unique$eff_start_date_min <= res_his_unique$index_enc_date)]))
+# 81453
+
+## define baseline address
 res_his_baseline <- res_his_unique %>%
   mutate(baseline_addr = case_when(index_enc_date < eff_end_date_max & index_enc_date >= eff_start_date_min~TRUE, 
                                    # if they have one address that has no end date then baseline_addr is true
@@ -82,7 +89,9 @@ res_his_baseline <- res_his_unique %>%
                                    TRUE~FALSE),
          addr_time_margin = case_when(baseline_addr~NA,
                                       index_enc_date < eff_start_date_min~difftime(index_enc_date, eff_start_date_min, units = 'day'),
-                                      index_enc_date > eff_end_date_max~difftime(index_enc_date, eff_end_date_max, units = 'day'),))
+                                      index_enc_date > eff_end_date_max~difftime(index_enc_date, eff_end_date_max, units = 'day')),
+         length_residence = case_when(!is.na(eff_end_date_max)~as.numeric(difftime(eff_end_date_max, eff_start_date_min, units='day')),
+                                      is.na(eff_end_date_max)~as.numeric(difftime("2023-08-01", eff_start_date_min, units='day'))))
 
 # check who has an exact baseline address
 table(res_his_baseline$baseline_addr) ## seems pretty good
@@ -102,32 +111,135 @@ res_his_baseline <- res_his_baseline %>%
                                    TRUE~baseline_addr)) %>%
   ungroup()
 
-length(unique(res_his_baseline$pat_id[which(res_his_baseline$baseline_addr)])) ## all but 4 patients
+length(unique(res_his_baseline$pat_id[which(res_his_baseline$baseline_addr)])) ## all but 3 patients
+
+################# FILTER TO BASELINE ADDRESS
 
 # filter to baseline address for each patient
 res_his_baseline_unique <- res_his_baseline %>% filter(baseline_addr)
-# look at all patients with more than one baseline census tract
-res_his_baseline_unique %>% group_by(pat_id) %>% filter(n()>1) %>% arrange(pat_id, eff_start_date_min) %>% View()
-# look at all patients with different baseline census tracts
-res_his_baseline_unique %>% group_by(pat_id) %>% filter(n()>1 & n_distinct(census_tract_final)>1) %>% arrange(pat_id, eff_start_date_min) %>% View()
-length(which(res_his_baseline_unique$mean_accuracy_score < 0.8))/dim(res_his_baseline_unique)[1] #3% are low accuracy
+# check that all patients have only one baseline census tract
+res_his_baseline_unique %>% group_by(pat_id) %>% filter(n()>1) %>% nrow()
+
+################# FILTER TO NYC METRO AREA ADDRESSES
 
 ## explore the distribution of census tracts
 table(substr(res_his_baseline_unique$full_fips_tract_final, 1, 2))
 # the most populous are NY, NJ, PA, CT and to a lesser extent CA, MA, MD, DC and GA
-length(which(substr(res_his_baseline_unique$full_fips_tract_final, 1, 2)!=36))
-length(unique(res_his_baseline_unique$pat_id[which(substr(res_his_baseline_unique$full_fips_tract_final, 1, 2)!=36)]))
+length(which(!substr(res_his_baseline_unique$full_fips_tract_final, 1, 2) %in% c(36, 09, 34, 42)))
+length(unique(res_his_baseline_unique$pat_id[which(!substr(res_his_baseline_unique$full_fips_tract_final, 1, 2) %in% c(36, 09, 34, 42))]))
 # around 14911 are not from NY
 # look at only NYC counties
 table(substr(res_his_baseline_unique$full_fips_tract_final, 1, 5))
 # filter to only those with a nyc county fips
-length(unique(res_his_baseline_unique$pat_id[which(substr(res_his_baseline_unique$full_fips_tract_final, 1, 5) %in% nyc_counties)]))
-# 81256 patients
-ids_nyc <- unique(res_his_baseline_unique$pat_id[which(substr(res_his_baseline_unique$full_fips_tract_final, 1, 5) %in% nyc_counties)])
+length(unique(res_his_baseline_unique$pat_id[which(!substr(res_his_baseline_unique$full_fips_tract_final, 1, 5) %in% nyc_counties$`State County fips`)]))
+## look at ages of those who do not live in NYC
+res_his_baseline_unique %>%
+  left_join(pat_cohort, by = 'pat_id') %>%
+  filter(!substr(res_his_baseline_unique$full_fips_tract_final, 1, 5) %in% nyc_counties$`State County fips`) %>%
+  ggplot(data=., aes(x=age_20160801)) +
+  geom_histogram(bins=20)
+# they are generally young on average (under 25 years), confirming Linda's suspicion
+# filter them out and move on
+res_his_baseline_unique <- res_his_baseline_unique %>% 
+  filter(substr(res_his_baseline_unique$full_fips_tract_final, 1, 5) %in% nyc_counties$`State County fips`)
+
+################# FILTER TO ADDRESSES WITH SUFFICIENT ACCURACY SCORE
+
+# look at accuracy score of patients with baseline census tracts
+length(which(res_his_baseline_unique$max_accuracy_score < 0.6)) #1813
+# for those with low accuracy look at their other address
+res_his %>%
+  filter(pat_id %in% unique(res_his_baseline_unique$pat_id[which(res_his_baseline_unique$max_accuracy_score < 0.6)])) %>%
+  left_join(res_his_baseline_unique, by='pat_id') %>%
+  select(pat_id, index_enc_date, eff_start_date, eff_end_date, full_fips_tract_final.x, contains('accuracy')) %>%
+  View()
+# some of these patients have an address directly prior which has an accuracy score of 1
+res_his_baseline %>%
+  filter(pat_id %in% unique(res_his_baseline_unique$pat_id[which(res_his_baseline_unique$max_accuracy_score < 0.6)])) %>%
+  select(pat_id, index_enc_date, eff_start_date_min, eff_end_date_max, full_fips_tract_final, contains('accuracy'), addr_time_margin) %>%
+  View()
+## how many could be filled in by another baseline_address with a better accuracy score
+res_his_baseline %>%
+  filter(pat_id %in% unique(res_his_baseline_unique$pat_id[which(res_his_baseline_unique$max_accuracy_score < 0.6)])) %>%
+  group_by(pat_id) %>%
+  mutate(better_accuracy_baseline = ifelse(lead(baseline_addr) & max_accuracy_score >= 0.6 & addr_time_margin <= 180,
+                                           TRUE, FALSE)) %>%
+  filter(better_accuracy_baseline) %>%
+  nrow()
+## this recoups 173 patients out of 1813 -- doesn't seem worth it
+res_his_baseline_unique <- res_his_baseline_unique %>% filter(max_accuracy_score >= 0.6)
+
+# write out the file
+write.csv(res_his_baseline_unique, 'Data/Derived/baseline_cohort_addresses.csv', row.names=FALSE)
+
+#########################################################################################
+### Group length of residence by relativity to baseline address #########################
+#########################################################################################
+
+res_his_weights <- res_his_baseline %>%
+  filter(pat_id %in% res_his_baseline_unique$pat_id) %>%
+  mutate(res_his_type = case_when(baseline_addr~'baseline',
+                                  eff_start_date_min >= index_enc_date~'during follow-up',
+                                  eff_end_date_max <= index_enc_date~'before baseline')) %>%
+  group_by(pat_id, res_his_type, full_fips_tract_final) %>%
+  summarise(length_residence_months = sum(length_residence, na.rm=TRUE)/30,
+            .groups='drop') %>%
+  group_by(pat_id, res_his_type) %>%
+  mutate(total_length_per_type = sum(length_residence_months, na.rm=TRUE)) %>%
+  ungroup() %>%
+  group_by(pat_id) %>%
+  mutate(total_length_res_his = sum(length_residence_months, na.rm=TRUE)) %>%
+  ungroup() %>%
+  mutate(weight_res_his = length_residence_months/total_length_res_his,
+         weight_res_type = length_residence_months/total_length_per_type)
+
+res_his_weights %>%
+  group_by(res_his_type) %>%
+  summarise(count=n(), .groups='drop')
+
+# write out the file
+write.csv(res_his_weights, 'Data/Derived/cohort_addresses_weights.csv', row.names=FALSE)
+
+### ARCHIVE CODE ########################################################################
+
+## look at length at that address compared to the address directly prior to it
+hist(res_his_baseline$length_residence[which(res_his_baseline$baseline_addr)], breaks=10)
+res_his_baseline %>%
+  group_by(pat_id) %>%
+  mutate(prior_length_residence = ifelse(baseline_addr, lag(length_residence), NA)) %>%
+  filter(baseline_addr) %>%
+  ggplot(data=., aes(x=length_residence, y=prior_length_residence)) +
+  geom_point() + 
+  geom_abline(slope=1, intercept=0, color='red') +
+  theme_bw()
+
+# the good news is that most participants lived at their baseline address longer than the address
+# directly prior to that one
+res_his_baseline %>%
+  group_by(pat_id) %>%
+  mutate(prior_length_residence = ifelse(baseline_addr, lag(length_residence), NA)) %>%
+  filter(baseline_addr & length_residence < prior_length_residence) %>%
+  nrow()
+## there are 3061 patients for whom their address directly prior to their baseline one is the
+## longer length of residence than their baseline one
+res_his_baseline %>%
+  group_by(pat_id) %>%
+  mutate(prior_length_residence = ifelse(baseline_addr, lag(length_residence), NA)) %>%
+  filter(baseline_addr & length_residence < prior_length_residence) %>%
+  ggplot(data=., aes(x=length_residence)) +
+  geom_histogram() +
+  geom_vline(xintercept=365, color='red') +
+  theme_bw()
+# of these patients, a portion lived at that address for less than a year
+res_his_baseline %>%
+  group_by(pat_id) %>%
+  mutate(prior_length_residence = ifelse(baseline_addr, lag(length_residence), NA)) %>%
+  filter(baseline_addr & length_residence < prior_length_residence) %>%
+  nrow()
 
 ## for those who do not have a baseline address in NYC but have any address in NYC look at them
 not_nyc_baseline <- res_his_baseline %>%
-  filter(!pat_id %in% ids_nyc) %>%
+  #filter(!pat_id %in% ids_nyc) %>%
   mutate(nyc_addr = ifelse(substr(full_fips_tract_final, 1, 5) %in% nyc_counties, TRUE, FALSE)) %>%
   arrange(pat_id, eff_start_date_min, eff_end_date_max) %>%
   group_by(pat_id) %>%
@@ -162,6 +274,5 @@ nyc_before_baseline %>%
   View()
 # I might want to look at the average length of residence up until index encounter for those who are in NYC addresses
 
-# write out the file
-write.csv(res_his_baseline_unique, 'Data/Derived/baseline_cohort_addresses.csv')
+
 

@@ -1,0 +1,285 @@
+---
+title: "Step 2.03: Symptom Outcome Exploration"
+author: "Mia Charifson"
+date: "2024-02-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = '/Users/miacharifson/Library/CloudStorage/OneDrive-NYULangoneHealth/Charifson Dissertation/')
+
+library(tidyverse)
+library(ggplot2)
+library(lubridate)
+library(tableone)
+library(arsenal)
+library(readxl)
+library(ggpubr)
+library(corrplot)
+library(data.table)
+library(forcats)
+```
+
+## Introduction
+
+The goal of this document is to: 
+
+1. define the timing of the first symptom related to UF and Endo symptomology for each patient (never, before entry, at baseline, during follow-up)
+2. explore the UF and Endo symptomolgy in our cohort population (which symptom, how many times)
+
+```{r load}
+pat_cohort <- read.csv('Data/Derived/pat_cohort_w_censoring.csv')
+menstrual_symptoms <- read.csv('Data/Epic/table3_dx_menstrual_symptoms.csv')
+other_symptoms <- read.csv('Data/Epic/table3_dx_other_symptoms.csv')
+```
+
+```{r join_symptoms}
+symptoms <- bind_rows(menstrual_symptoms, other_symptoms) %>%
+  inner_join(pat_cohort %>% select(pat_id, index_enc_date), by='pat_id')
+```
+
+## First, some cleaning
+
+There are `r length(which(symptoms$dx_date == 'NULL'))` entries where the date of the diagnosis code is missing. All of these are `Medical History` type diagnoses. These are generally uninformative without a diagnosis date. 
+
+TO DO: try to recover diagnosis dates for as many of these rows as possible, by joining on encounter ID.
+
+```{r, eval=FALSE}
+table(symptoms$dx_type[which(symptoms$dx_date=='NULL')])
+
+symptoms %>%
+  group_by(pat_id) %>%
+  filter(n() == sum(dx_type == 'Medical History')) %>%
+  arrange(pat_id)
+```
+
+## When do patients have their first UF or Endo related symptom?
+
+There are `r length(unique(symptoms$pat_id))` patients in our cohort who have at least one UF or Endo related symptom in their EHR.
+
+```{r first_symptom}
+first_symptom <- symptoms %>%
+  group_by(pat_id) %>%
+  summarise(index_enc_date = min(index_enc_date),
+            dx_date = min(dx_date, na.rm=TRUE),
+            dx_names = paste0(unique(dx_name),collapse = ', '),
+            icd10s = paste0(unique(icd10),collapse = ', '),
+            n_specific_symptoms = sum(!grepl('M54.5|R19.7', icd10)),
+            .groups='drop') %>%
+  mutate(dx_date = as.Date(dx_date), 
+         index_enc_date = as.Date(index_enc_date), 
+         time_group = case_when(dx_date<index_enc_date~'before baseline', 
+                                dx_date>=index_enc_date & dx_date<=(ymd(index_enc_date) + years(1))~'at baseline',
+                                dx_date>(ymd(index_enc_date)+years(1))~'during follow-up',
+                                TRUE~'has symptom, no date'),
+         flag = case_when(grepl('M54.5|R19.7', icd10s) & n_specific_symptoms == 0~TRUE,
+                          TRUE~FALSE))
+
+flag_ids <- unique(first_symptom$pat_id[which(first_symptom$flag)])
+```
+
+```{r first_symptom_table, results='asis'}
+pat_cohort %>%
+  select(pat_id) %>%
+  left_join(first_symptom %>% filter(!flag), by='pat_id') %>%
+  mutate(time_group = ifelse(is.na(time_group), 'never', time_group)) %>%
+  tableby(~time_group, data=.) %>%
+  summary()
+```
+
+## For patients who have symptoms, how many symptoms do they report since their first one?
+
+A distinct symptom is counted as a unique diagnosis date-ICD10 code combinations.
+
+```{r symptom_count_fig}
+symptoms %>%
+  filter(!pat_id %in% flag_ids) %>%
+  group_by(pat_id) %>%
+  summarise(count_symptoms = n_distinct(dx_date, icd10), .groups='drop') %>%
+  ggplot(aes(x=count_symptoms), data=.) +
+  geom_histogram(fill= 'gray', color='black', bins = 100) +
+  theme_bw()
+```
+
+```{r symptom_count_table, results='asis'}
+symptoms %>%
+  filter(!pat_id %in% flag_ids) %>%
+  group_by(pat_id) %>%
+  summarise(count_symptoms = n_distinct(dx_date, icd10), .groups='drop') %>%
+  tableby(~count_symptoms, data=., numeric.stats = c('mean', 'median', 'q1q3', 'range')) %>%
+  summary()
+```
+
+## Which symptoms are commonly reported in this cohort?
+
+```{r}
+symptom_wide_boolean <- symptoms %>%
+  filter(!pat_id %in% flag_ids) %>%
+  group_by(pat_id, dx_date) %>%
+  summarise(Pelvic_pain = (sum(grepl('R10.2', icd10))>=1),
+         Dysmenorrhea = (sum(grepl('N94.[4-6]', icd10))>=1),
+         Dyspareunia = (sum(grepl('F52.6|N94.1', icd10))>=1),
+         Infertility = (sum(grepl('N97.9', icd10))>=1),
+         Intermenstrual_pain = (sum(grepl('N94.0', icd10))>=1),
+         Ovarian_cysts = (sum(grepl('N83.0|N83.2', icd10))>=1),
+         Anemia = (sum(grepl('D50.0', icd10))>=1),
+         Back_pain = (sum(grepl('M54.5', icd10))>=1),
+         Postcoital_bleed = (sum(grepl('N93.0', icd10))>=1),
+         AUB = (sum(grepl('N93.8|N93.9', icd10))>=1),
+         Diarrhea = (sum(grepl('R19.7', icd10))>=1),
+         Menorrhagia = (sum(grepl('N92.0|N92.1', icd10))>=1),
+         Bladder_rectum_symptoms = (sum(grepl('N32.9|K59.00', icd10))>=1),
+         Urinary_urgency = (sum(grepl('N39.3', icd10))>=1),
+         .groups='drop')
+```
+
+```{r}
+patient_counts <- symptom_wide_boolean %>%
+  summarise(Pelvic_pain = n_distinct(pat_id[Pelvic_pain]),
+         Dysmenorrhea = n_distinct(pat_id[Dysmenorrhea]),
+         Dyspareunia = n_distinct(pat_id[Dyspareunia]),
+         Infertility = n_distinct(pat_id[Infertility]),
+         Intermenstrual_pain = n_distinct(pat_id[Intermenstrual_pain]),
+         Ovarian_cysts = n_distinct(pat_id[Ovarian_cysts]),
+         Anemia = n_distinct(pat_id[Anemia]),
+         Back_pain = n_distinct(pat_id[Back_pain]),
+         Postcoital_bleed = n_distinct(pat_id[Postcoital_bleed]),
+         AUB = n_distinct(pat_id[AUB]),
+         Diarrhea = n_distinct(pat_id[Diarrhea]),
+         Menorrhagia = n_distinct(pat_id[Menorrhagia]),
+         Bladder_rectum_symptoms = n_distinct(pat_id[Bladder_rectum_symptoms]),
+         Urinary_urgency = n_distinct(pat_id[Urinary_urgency])) %>%
+  pivot_longer(cols=everything(), names_to='Symptom', values_to='Count') %>%
+  mutate(Percent = paste0(round(Count/nrow(pat_cohort)*100, 2), '%'))
+
+patient_counts %>%
+  ggplot(aes(x=Count, y=fct_reorder(Symptom, Count), fill=Symptom), data=.) +
+  geom_col() + 
+  geom_label(aes(label=Percent), fill='white', label.padding = unit(0.1, "lines")) +
+  theme_bw() + 
+  ylab('Symptom Name') +
+  xlab('Count of unique patients') +
+  theme(legend.position = 'none')
+```
+
+```{r}
+symptom_wide_boolean %>% 
+  summarise(Pelvic_pain = sum(Pelvic_pain),
+         Dysmenorrhea = sum(Dysmenorrhea),
+         Dyspareunia = sum(Dyspareunia),
+         Infertility = sum(Infertility),
+         Intermenstrual_pain = sum(Intermenstrual_pain),
+         Ovarian_cysts = sum(Ovarian_cysts),
+         Anemia = sum(Anemia),
+         Back_pain = sum(Back_pain),
+         Postcoital_bleed = sum(Postcoital_bleed),
+         AUB = sum(AUB),
+         Diarrhea = sum(Diarrhea),
+         Menorrhagia = sum(Menorrhagia),
+         Bladder_rectum_symptoms = sum(Bladder_rectum_symptoms),
+         Urinary_urgency = sum(Urinary_urgency)) %>%
+  pivot_longer(cols=everything(), names_to='Symptom', values_to='Count') %>%
+  ggplot(aes(x=Count, y=fct_reorder(Symptom, Count), fill=Symptom), data=.) +
+  geom_col() +
+  theme_bw() + 
+  ylab('Symptom Name') +
+  xlab('Count of unique instances') +
+  theme(legend.position = 'none')
+```
+
+## Which symptom is commonly reported for the first symptom at baseline & during follow-up?
+
+```{r}
+n_timegroup <- table(first_symptom$time_group)
+patient_counts <- first_symptom %>%
+  filter(!flag) %>%
+  group_by(time_group) %>%
+  summarise(Pelvic_pain = (sum(grepl('R10.2', icd10s))),
+         Dysmenorrhea = (sum(grepl('N94.[4-6]', icd10s))),
+         Dyspareunia = (sum(grepl('F52.6|N94.1', icd10s))),
+         Infertility = (sum(grepl('N97.9', icd10s))),
+         Intermenstrual_pain = (sum(grepl('N94.0', icd10s))),
+         Ovarian_cysts = (sum(grepl('N83.0|N83.2', icd10s))),
+         Anemia = (sum(grepl('D50.0', icd10s))),
+         Back_pain = (sum(grepl('M54.5', icd10s))),
+         Postcoital_bleed = (sum(grepl('N93.0', icd10s))),
+         AUB = (sum(grepl('N93.8|N93.9', icd10s))),
+         Diarrhea = (sum(grepl('R19.7', icd10s))),
+         Menorrhagia = (sum(grepl('N92.0|N92.1', icd10s))),
+         Bladder_rectum_symptoms = (sum(grepl('N32.9|K59.00', icd10s))),
+         Urinary_urgency = (sum(grepl('N39.3', icd10s)))) %>%
+  pivot_longer(cols=c(Pelvic_pain:Urinary_urgency), names_to='Symptom', values_to='Count') %>%
+  mutate(Percent = case_when(time_group == 'at baseline' ~ Count/n_timegroup[1],
+                             time_group == 'during follow-up' ~ Count/n_timegroup[3],
+                             time_group == 'before baseline' ~ Count/n_timegroup[2]), 
+         Percent = paste0(round(Percent*100, 2), '%'))
+
+patient_counts %>%
+  filter(time_group %in% c('at baseline', 'during follow-up')) %>%
+  ggplot(aes(x=Count, y=fct_reorder(Symptom, Count), fill=Symptom), data=.) +
+  geom_col() + 
+  geom_label(aes(label=Percent), fill='white', label.padding = unit(0.1, "lines")) +
+  theme_bw() + 
+  ylab('Symptom Name') +
+  xlab('Count of unique patients') +
+  theme(legend.position = 'none') +
+  facet_wrap(~time_group)
+```
+
+## What symptoms are associated with each other?
+
+```{r}
+symptom_wide <- symptoms %>%
+  filter(!pat_id %in% flag_ids) %>%
+  group_by(pat_id, dx_date) %>%
+  summarise(Pelvic_pain = (sum(grepl('R10.2', icd10))>=1),
+         Dysmenorrhea = (sum(grepl('N94.[4-6]', icd10))>=1),
+         Dyspareunia = (sum(grepl('F52.6|N94.1', icd10))>=1),
+         Infertility = (sum(grepl('N97.9', icd10))>=1),
+         Intermenstrual_pain = (sum(grepl('N94.0', icd10))>=1),
+         Ovarian_cysts = (sum(grepl('N83.0|N83.2', icd10))>=1),
+         Anemia = (sum(grepl('D50.0', icd10))>=1),
+         Back_pain = (sum(grepl('M54.5', icd10))>=1),
+         Post_coital_bleed = (sum(grepl('N93.0', icd10))>=1),
+         AUB = (sum(grepl('N93.8|N93.9', icd10))>=1),
+         Diarrhea = (sum(grepl('R19.7', icd10))>=1),
+         Menorrhagia = (sum(grepl('N92.0|N92.1', icd10))>=1),
+         Bladder_rectum_symptoms = (sum(grepl('N32.9|K59.00', icd10))>=1),
+         Urinary_urgency = (sum(grepl('N39.3', icd10))>=1),
+         .groups='drop')
+```
+
+```{r}
+symptom_wide_count <- symptoms %>%
+  filter(!pat_id %in% flag_ids) %>%
+  group_by(pat_id) %>%
+  summarise(Pelvic_pain = (sum(grepl('R10.2', icd10))),
+         Dysmenorrhea = (sum(grepl('N94.[4-6]', icd10))),
+         Dyspareunia = (sum(grepl('F52.6|N94.1', icd10))),
+         Infertility = (sum(grepl('N97.9', icd10))),
+         Intermenstrual_pain = (sum(grepl('N94.0', icd10))),
+         Ovarian_cysts = (sum(grepl('N83.0|N83.2', icd10))),
+         Anemia = (sum(grepl('D50.0', icd10))),
+         Back_pain = (sum(grepl('M54.5', icd10))),
+         Post_coital_bleed = (sum(grepl('N93.0', icd10))),
+         AUB = (sum(grepl('N93.8|N93.9', icd10))),
+         Diarrhea = (sum(grepl('R19.7', icd10))),
+         Menorrhagia = (sum(grepl('N92.0|N92.1', icd10))),
+         Bladder_rectum_symptoms = (sum(grepl('N32.9|K59.00', icd10))),
+         Urinary_urgency = (sum(grepl('N39.3', icd10))),
+         .groups='drop')
+```
+
+```{r}
+corrplot.mixed(cor(symptom_wide_count[, -c(1)]), upper = 'square')
+```
+
+```{r}
+require(graphics); require(grDevices)
+x <- cor(symptom_wide_count[, -c(1)])
+rc <- rainbow(nrow(x), start = 0, end = .3)
+cc <- rainbow(ncol(x), start = 0, end = .3)
+heatmap(x, RowSideColors = rc, ColSideColors = cc)
+```
+

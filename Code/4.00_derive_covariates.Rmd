@@ -1,0 +1,841 @@
+---
+title: "Covariate Cleaning"
+author: "Mia Charifson"
+date: "2024-01-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE, message=FALSE)
+knitr::opts_knit$set(root.dir = '/Users/miacharifson/Library/CloudStorage/OneDrive-NYULangoneHealth/Charifson Dissertation/')
+```
+
+```{r lib}
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(kableExtra)
+library(tableone)
+library(stringr)
+library(arsenal)
+```
+
+```{r load}
+pat_cohort <- read.csv('Data/Derived/pat_cohort_w_censoring.csv')
+ART_use <- read.csv('Data/Epic/table3_dx_ARTuse.csv')
+empy_status <- read.csv('Data/Epic/table6_empy_status.csv')
+enc_info_baseline <- read.csv('Data/Epic/table6_enc_info_baseline.csv')
+ethnicity <- read.csv('Data/Epic/table6_ethnicity.csv')
+marital <- read.csv('Data/Epic/table6_marital_status.csv')
+ob_baseline <- read.csv("Data/Epic/table6_ob_baseline.csv")
+race <- read.csv('Data/Epic/table6_race.csv')
+edu <- read.csv('Data/Epic/table6_social_edu.csv')
+other <- read.csv('Data/Epic/table6_other.csv')
+occupn <- read.csv('Data/Epic/table6_occupation_hx.csv')
+insur_baseline <- read.csv('Data/Epic/insurance_baseline.csv')
+insur_map <- read.csv('Data/External/CHES_insurance_map.csv')
+hc_use_dx <- read.csv('Data/Epic/table3_diagnosis_HCuse.csv')
+hc_use_social <- read.csv('Data/Epic/table6_social_HCuse.csv')
+```
+
+```{r functions}
+print_percent <- function(number) {
+  return(paste0(round(number, 3)*100, '%'))
+}
+```
+
+```{r subset}
+covars <- enc_info_baseline %>% 
+  select(pat_id, bmi, pat_homeless_type) %>%
+  full_join(ethnicity %>% select(-raw_ethnicity_background_line), by='pat_id') %>%
+  full_join(race %>% select(-race_line), by='pat_id') %>%
+  full_join(social_baseline %>% 
+              select(-pat_enc_csn_id, -contact_date, -index_enc_date, -margin)
+            , by='pat_id') %>%
+  full_join(ob_baseline %>% 
+              select(-pat_enc_csn_id, -contact_date, -index_enc_date, -margin, -rwn)
+            , by='pat_id') %>%
+  full_join(other, by='pat_id') %>%
+  filter(pat_id %in% pat_cohort$pat_id)
+marital <- marital %>% filter(pat_id %in% pat_cohort$pat_id)
+edu <- edu %>% filter(pat_id %in% pat_cohort$pat_id)
+empy_status <- empy_status %>% filter(pat_id %in% pat_cohort$pat_id)
+```
+
+```{r na_if}
+covars$fhc_race_group <- na_if(covars$fhc_race_group, 'Unreported/Refused to Report Race')
+covars <- covars %>% 
+  mutate(across(where(is.character), ~na_if(., "NULL")),
+         fhc_race_group = na_if(fhc_race_group, 'Unreported/Refused to Report Race'),
+         fhc_ethnicity = ifelse(grepl('Unreported|Unmapped', fhc_value), NA, fhc_value),
+         bmi = as.numeric(bmi)) %>%
+  mutate(across(contains('ob'), ~as.numeric(.)))
+```
+
+# Covariate Cleaning
+
+The purpose of this document is to 
+
+(1) derive covariates that are not pre-specified in the data which includes:
+
+- Healthcare utilization (HCU)
+- Socioeconomic variables (educational attainment & employment)
+- Insurance status
+- ART use
+- Hormonal Contraceptive Use
+
+Additional covariates already derived but that need to be cleaned are: 
+
+- Race/ethnicity
+- Age
+- Parity
+- Preferred Language
+- Marital status
+- Hormonal contraceptive use
+- Nativity/Immigration Status
+- BMI
+
+(2) explore distributions of the covariates
+
+(3) explore missingness of the covariates
+
+## 1: Derive Covariates {.tabset}
+
+### Healthcare utilization
+
+Healthcare utilization at baseline and throughout follow-up was derived in step 1.0. 
+
+Healthcare utilization at baseline is defined as the number of relevant care encounters in the first year since their index encounter. If they have none, their value is set to 0. 
+
+Healthcare utilization throughout follow-up is defined as the number of relevant care encounters per calendar year (including the first year).
+
+### Educational attainment
+
+There are `r length(unique(edu$pat_id))` patients with any educational attainment information. 
+
+```{r clean_edu}
+edu_new <- edu %>% 
+  mutate(across(where(is.character), ~na_if(., "NULL"))) %>%
+  filter(!is.na(edu_level) | !is.na(years_education)) %>%
+  left_join(pat_cohort %>% select(pat_id, age_20160801, index_enc_date)) %>%
+  mutate(margin = abs(difftime(index_enc_date, contact_date, units='day')))
+```
+
+These come in the form of highest level of education (categorical) (n=`r length(unique(edu_new$pat_id[!is.na(edu_new$edu_level)]))` unique patients report) and number of years of education (free text) (n=`r length(unique(edu_new$pat_id[!is.na(edu_new$years_education)]))` unique patients report). 
+
+This doesn't seem worth it to clean since only `r print_percent(length(unique(edu$pat_id))/dim(pat_cohort)[1])`% of patients have anything to clean at all. 
+
+```{r edu_clean, eval=FALSE}
+edu_new <- edu %>% 
+  mutate(across(where(is.character), ~na_if(., "NULL"))) %>%
+  filter(!is.na(edu_level) | !is.na(years_education))
+#unique(edu$edu_level)
+#length(unique(edu$pat_id[!is.na(edu$years_education) & is.na(edu$edu_level)]))
+#length(unique(edu$pat_id[!is.na(edu$edu_level)]))
+
+below_GED <- c('11th grade', '8th grade')
+GED_equivalent <- c('GED or equivalent', '12th grade', 'High school graduate')
+some_college <- c('Some college, no degree', 'Associate degree: occupational, technical, or vocational program', "Associate degree: academic program")
+college <- c("Bachelor's degree (e.g., BA, AB, BS)")
+some_grad_school <- c("Master's degree (e.g., MA, MS, MEng, MEd, MSW, MBA)", 
+                      "Professional school degree (e.g., MD, DDS, DVM, JD)",
+                      "Doctorate")
+
+edu_new <- edu_new %>%
+  mutate(edu_level_new = case_when(edu_level %in% below_GED ~ 'Below GED', 
+                                   edu_level %in% GED_equivalent ~ 'GED or equivalent', 
+                                   edu_level %in% some_college ~ 'Some college (including associates)',
+                                   edu_level %in% college ~ 'College (BA, AB, BS)', 
+                                   edu_level %in% some_grad_school ~ 'Any graduate schooling',
+                                   TRUE~NA))
+  
+CreateTableOne(data=edu_new %>% filter(!is.na(edu_level)), vars=c('edu_level', 'edu_level_new'))
+```
+
+```{r edu_num, eval=FALSE}
+edu_new %>%
+  left_join(pat_cohort %>% select(pat_id, age_20160801), by='pat_id') %>%
+  filter(!is.na(years_education)) %>%
+  mutate(years_edu_num = as.numeric(str_extract(years_education, '[0-9]+')),
+         year_type = case_when(grepl('grade|th', tolower(years_education))~'grade',
+                               grepl('(?:year|yr).*(coll)',tolower(years_education),perl=TRUE)~'college',
+                               TRUE~NA)) %>%
+  filter(years_edu_num == 12 & year_type == 'grade') %>%
+  select(pat_id, age_20160801, years_education, years_edu_num, year_type) %>%
+  distinct() %>%
+  arrange(desc(age_20160801))
+  #filter(!is.na(years_edu_num)) %>% group_by(years_education, years_edu_num, year_type) %>% 
+  #summarise(count=n(), .groups='drop') %>% arrange(year_type, years_edu_num) %>%
+  mutate(edu_level_new = case_when(years_edu_num %in% c(1:11) & 
+                                     year_type == 'grade'~'Below GED', 
+                                   years_edu_num %in% c(12, 112) & 
+                                     year_type == 'grade'~'GED or equivalent', 
+                                   years_edu_num %in% c(13:15)~'Some college',
+                                   years_edu_num %in% c(1:3) & 
+                                     year_type == 'college'~'Some college',
+                                   years_edu_num >= 16 ~'College or higher',
+                                   years_edu_num==4 & 
+                                     year_type == 'college' ~'College or higher',
+                                   grepl(grad_strings, years_education)~'College or higher')) %>%
+  CreateTableOne(data=., vars='edu_level_new', includeNA=TRUE)
+```
+
+```{r yrs_edu_clean, eval=FALSE}
+# 11th grade
+edu_new$years_edu_clean[grepl('5th|8th|9th|10th|11th', tolower(edu_new$years_education))] <- 'Below GED'
+edu_new$years_edu_clean[grepl('high s', tolower(edu_new$years_education)) 
+                               & grepl('sen|some|junior|last|ing', tolower(edu_new$years_education))] <- 'Below GED' 
+# 12th grade
+edu_new$years_edu_clean[grepl('12', tolower(edu_new$years_education))] <- 'GED or equivalent'
+edu_new$years_edu_clean[grepl('high s', tolower(edu_new$years_education)) 
+                               & !grepl('sen|some|junior|last|ing', tolower(edu_new$years_education))] <- 'GED or equivalent' 
+# some college
+edu_new$years_edu_clean[grepl('some|year|yr|in|freshman|junior', tolower(edu_new$years_education)) 
+                        & !grepl('prep|finished|complete', tolower(edu_new$years_education))
+                        & grepl('coll|assoc', tolower(edu_new$years_education)) ] <- 'Some college, including Associates'
+# bachelors
+edu_new$years_edu_clean[grepl('bac|BA|BS|Bach', edu_new$years_education) 
+                        & !grepl('MBA|-BBA|BBA-', edu_new$years_education)] <- 'College (BA, AB, BS)'
+edu_new$years_edu_clean[!grepl('some|year|yr|in|freshman|junior|prep|jr', tolower(edu_new$years_education)) 
+                        & grepl('coll', tolower(edu_new$years_education))] <- 'College (BA, AB, BS)'
+# master's
+edu_new$years_edu_clean[grepl('MA|mas|Mas|MAS|MS', edu_new$years_education) 
+                        & !grepl('NMS', edu_new$years_education)] <- 'Any graduate schooling'
+# graduate school
+grad_strings <- c('doct|grad school|law|medical|graduate level|graduate school|meng|msw|mba|mph|phd|ph. d|ph.d|md|jd|dds|dvm|ma|ms|ba|bs')
+edu_new$years_edu_clean[grepl(grad_strings, tolower(edu_new$years_education))] <- 'Any graduate schooling'
+```
+
+```{r check_edu, eval=FALSE}
+CreateTableOne(data=edu_new, vars=c('years_edu_clean'), includeNA = TRUE)
+unique(edu_new$years_education[which(is.na(edu_new$years_edu_clean))])
+```
+
+### Employment Status
+
+There are `r length(unique(empy_status$pat_id))` patients with employment status information and `r length(unique(covars$pat_id[which(!is.na(covars$occupation))]))` with occupation information. 
+
+```{r empy_clean}
+empy_baseline <- empy_status %>%
+  left_join(pat_cohort %>% select(pat_id, index_enc_date), by='pat_id') %>%
+  mutate(margin = difftime(change_time, index_enc_date, unit='days'),
+         old_empy_status = case_when(grepl('NULL|Unknown', old_empy_status)~NA,
+                                        TRUE~old_empy_status),
+         new_empy_status = case_when(grepl('NULL|Unknown', new_empy_status)~NA,
+                                        TRUE~new_empy_status)) %>%
+  group_by(pat_id) %>%
+  filter(min(abs(margin)) == abs(margin)) %>%
+  ungroup() %>%
+  # if either is missing take the one that isn't missing, otherwise take according to date
+  mutate(empy_status_baseline = case_when(is.na(old_empy_status) | is.na(new_empy_status)~
+                                               coalesce(new_empy_status, old_empy_status),
+                                             index_enc_date < change_time~old_empy_status, 
+                                             index_enc_date >= change_time~new_empy_status)) %>%
+  filter(!is.na(empy_status_baseline))
+```
+
+After cleaning the employment status table, there are `r length(unique(empy_baseline$pat_id))` patients had an employment status at some point, which we can use for their baseline employment status. 
+
+`r length(which(empy_baseline$margin > 0))` are employment statuses reported after their index encounter.
+
+```{r hist_empy_margin, eval=FALSE}
+empy_baseline %>%
+  filter(margin > 0) %>%
+  ggplot(data=., aes(x=margin/365)) + 
+  geom_histogram() + 
+  xlab('Difference between date of employment status and index encounter (yrs)') +
+  theme_bw()
+```
+
+```{r empy_summary}
+CreateTableOne(data=empy_baseline, var='empy_status_baseline')
+```
+
+```{r, eval=FALSE}
+unique(covars$occupation[which(grepl('none|not|unem|n/a|umep|unep|disable|disability',
+                                     tolower(covars$occupation)) &
+                                 !grepl('art|work|dame|analyst|sales', tolower(covars$occupation)))])
+unique(covars$occupation[which(covars$occupation=="" | covars$occupation==".")])
+unique(covars$occupation[which(grepl('part ', tolower(covars$occupation)))])
+unique(covars$occupation[which(grepl('retired', tolower(covars$occupation)))])
+
+unique(covars$occupation[which(grepl('no empleo|nort em|nt em', tolower(covars$occupation)))])
+```
+
+```{r occupn_clean}
+umemployed_strs <- c('none|not|unem|n/a|umep|unep|disabled|disability|no empleo|nort em|nt em')
+
+occupn_clean <- covars %>% 
+  select(pat_id, occupation) %>%
+  distinct() %>%
+  mutate(occupn_clean = case_when(occupation == '   ' | occupation == '.'~NA, 
+                                  grepl('prefer|refuse|discuss', tolower(occupation))~NA,
+                                  TRUE~tolower(occupation)),
+         empy_status_new = case_when(grepl('student', occupn_clean)~'Student',
+                                     grepl('part ', occupn_clean)~'Part Time',
+                                     grepl('self em|self-em', occupn_clean)~'Self Employed',
+                                     grepl('retired', occupn_clean)~'Retired',
+                                     grepl(umemployed_strs,occupn_clean) &
+                                       !grepl('art|work|dame|analyst|sales',occupn_clean)~'Not Employed',
+                                     !is.na(occupn_clean)~'Employed (unspecific)',
+                                     TRUE~NA)) %>%
+  filter(!is.na(empy_status_new))
+
+CreateTableOne(data=occupn_clean, var='empy_status_new')
+```
+
+```{r}
+employment_final <- empy_baseline %>%
+  full_join(occupn_clean, by='pat_id') %>%
+  mutate(emply_final = case_when(!is.na(empy_status_baseline) & margin < 730~empy_status_baseline,
+                                 TRUE~coalesce(empy_status_new, empy_status_baseline))) %>%
+  filter(!is.na(emply_final))
+```
+
+The occupation history data filled in some of the missing data and data with a large margin (>2 years). Overall, we have good coverage of employment status at baseline in this cohort (`r print_percent(dim(employment_final)[1]/dim(pat_cohort)[1])`% of patients).
+
+```{r, eval=FALSE}
+employment_final %>%
+  filter(!is.na(empy_status_baseline) & !is.na(empy_status_new)) %>%
+  select(pat_id, emply_final, empy_status_baseline, margin, empy_status_new)
+```
+
+### Insurance status
+
+In 2017, the percent of US Americans on some kind of public health insurance was 34-37% (based on US Census data[https://www.census.gov/content/dam/Census/library/publications/2022/demo/p60-278.pdf]) This includes medicare, medicaid, VA, CHAMPVA plans and NYS specific plans (child & family health plus, managed care plans, essential plans).
+
+```{r clean_insur}
+insur_baseline_unique <- insur_baseline %>%
+  mutate(pat_enc_csn_id = as.character(pat_enc_csn_id),
+         enc_date = as.Date(enc_date, '%Y-%m-%d')) %>%
+  inner_join(pat_cohort %>% 
+               select(pat_id, all_pat_enc_csn_id, index_enc_date) %>%
+               mutate(index_enc_date = as.Date(index_enc_date, '%Y-%m-%d')), 
+             by=c('pat_id'='pat_id', 'enc_date'='index_enc_date'))
+
+insur_baseline_unique <- insur_baseline_unique %>%
+  mutate(across(where(is.character), ~na_if(., "NULL")))
+```
+
+For insurance status at baseline, I used the mapping from FHC for insurance type and merged this to the encounter data at baseline. 
+
+```{r}
+length(unique(insur_baseline$payor_name))
+length(unique(insur_baseline$benefit_plan_name))
+
+length(which(grepl('medicare', tolower(unique(insur_baseline$benefit_plan_name)))))
+unique(insur_baseline$benefit_plan_name)[which(grepl('medicare', tolower(unique(insur_baseline$benefit_plan_name))))]
+
+length(which(grepl('medicaid', tolower(unique(insur_baseline$benefit_plan_name)))))
+unique(insur_baseline$benefit_plan_name)[which(grepl('medicaid', tolower(unique(insur_baseline$benefit_plan_name))))]
+
+length(which(grepl('managed', tolower(unique(insur_baseline$benefit_plan_name)))))
+unique(insur_baseline$benefit_plan_name)[which(grepl('managed', tolower(unique(insur_baseline$benefit_plan_name))))]
+
+length(which(grepl('family health', tolower(unique(insur_baseline$benefit_plan_name)))))
+unique(insur_baseline$benefit_plan_name)[which(grepl('family health', tolower(unique(insur_baseline$benefit_plan_name))))]
+
+length(which(grepl('veteran', tolower(unique(insur_baseline$benefit_plan_name)))))
+unique(insur_baseline$benefit_plan_name)[which(grepl('veteran', tolower(unique(insur_baseline$benefit_plan_name))))]
+
+length(which(grepl('champva', tolower(unique(insur_baseline$benefit_plan_name)))))
+
+length(which(grepl('child health', tolower(unique(insur_baseline$benefit_plan_name)))))
+unique(insur_baseline$benefit_plan_name)[which(grepl('child health', tolower(unique(insur_baseline$benefit_plan_name))))]
+
+length(which(grepl('essential', tolower(unique(insur_baseline$benefit_plan_name)))))
+unique(insur_baseline$benefit_plan_name)[which(grepl('essential', tolower(unique(insur_baseline$benefit_plan_name))))]
+
+length(which(grepl('healthy new york', tolower(unique(insur_baseline$benefit_plan_name)))))
+```
+
+`r length(unique(insur_baseline_unique$pat_id[which(!is.na(insur_baseline_unique$insurance_type))]))` patients have a labelled insurance type at baseline. 
+
+Maybe -- email Sara Long
+
+```{r}
+public_plans <- 'medicare|medicaid|family health|veteran|champva|healthy new york|child health|essential'
+
+insur_clean <- insur_baseline %>%
+  mutate(insur_status = case_when(grepl(public_plans, tolower(benefit_plan_name))~'public',
+                                  TRUE~'private'))
+
+length(which(insur_clean$insur_status == 'public'))/dim(insur_clean)[1]
+```
+
+```{r}
+insur_clean %>%
+  filter(insur_status == 'private') %>%
+  distinct(payor_name, benefit_plan_name)
+```
+
+
+```{r missing_insurance}
+insur_baseline_unique %>% 
+  filter(is.na(insurance_type)) %>%
+  group_by(payor_name, benefit_plan_name) %>%
+  summarise(count=n(), .groups='drop') %>%
+  arrange(desc(count))
+```
+I can add some BSBC to Blue Cross category
+
+```{r}
+insur_baseline_unique %>% 
+  filter(insurance_type == "Managed Care") %>%
+  group_by(payor_name, benefit_plan_name) %>%
+  summarise(count=n(), .groups='drop') %>%
+  arrange(desc(count))
+```
+```{r}
+insur_baseline_unique %>% 
+  filter(grepl('medicaid', tolower(benefit_plan_name))) %>%
+  group_by(payor_name, benefit_plan_name) %>%
+  summarise(count=n(), .groups='drop') %>%
+  arrange(desc(count))
+```
+
+### Assisted Reproductive Technology (ART) Use
+
+```{r clean_ART}
+ART_use_new <- pat_cohort %>%
+  select(pat_id, index_enc_date) %>%
+  left_join(ART_use, by='pat_id') %>%
+  mutate(dx_date = as.Date(dx_date),
+         ART_use_baseline = case_when(dx_date <= index_enc_date~TRUE,
+                                      TRUE~FALSE),
+         ART_use_fu = case_when(dx_date > index_enc_date~TRUE,
+                                TRUE~FALSE)) %>%
+  group_by(pat_id) %>%
+  mutate(ART_fu_date = case_when(sum(ART_use_fu)>=1~min(dx_date), 
+                                 TRUE~NA)) %>%
+  ungroup()
+```
+
+For ART use, we are interested in (1) if a patient had use ART prior to baseline and (2) if they use ART at some point during follow-up (if they do receive ART care during FU then we also want to record the date of the earliest ART). We assume that if they do not have any diagnosis codes for ART in their EHR then they do not have ART use. This is a strong assumption given that patients can receive ART care outside of NYU, but we assume this would be indicated somewhere in their EHR considering they receive regular and relevant care at NYU.
+
+### Race and Ethnicity 
+
+When cleaning the race and ethnicity data for missingness I use the following assumptions: 
+
+1. If race is missing but ethnicity is not missing and is not set to 'Hispanic/Latino' or 'Non-Hispanic/Latino', then race is set to the value of ethnicity. 
+- Limitation: this assumes only partial info on this patient's race given they could have other unreported racial groups. 
+
+2. If ethnicity is missing but race = 'Hispanic/Latino', then ethnicity is set to 'Hispanic/Latino'.
+
+3. If ethnicity or race is anything other than 'Hispanic/Latino' more than once (they enter their race or ethnicity multiple times and multiple times do not indicate Hispanic/Latino), then their ethnicity is assumed to be 'Non-Hispanic/Latino'.
+- Limitation: this does not impute ethnicity for patient's with race reported only once, but makes an assumption based on the quantity of data.
+
+4. In the merged race and ethnicity variable, we make the following choices:
+- if someone reports more than one race, then they are labelled 'Multiple races'
+- if someone reports being Hispanic/Latino, then they are labelled 'Hispanic/Latino', therefore all race categories are labelled as non-Hispanic (NH)
+
+```{r clean_race_ethnic}
+# get distinct instances of race, ethnicity and number of times the patient indicated that identity
+race_ethnic <- covars %>%
+  group_by(pat_id, fhc_race_group) %>%
+  summarise(race_count=sum(!is.na(fhc_race_group)), .groups='drop') %>%
+  full_join(covars %>% 
+              group_by(pat_id, fhc_ethnicity) %>%
+              summarise(ethnicity_count=sum(!is.na(fhc_ethnicity)), .groups='drop'), 
+            by='pat_id')
+  
+ethnicity_strings <- c('Non-Hispanic/Latino', 'Hispanic/Latino')
+# create final version of race and ethnicity
+race_ethnic <- race_ethnic %>% group_by(pat_id) %>%
+  mutate(race_final = case_when(!is.na(fhc_race_group) & !fhc_race_group %in% ethnicity_strings~fhc_race_group, 
+                                !is.na(fhc_ethnicity) & !fhc_ethnicity %in% ethnicity_strings~fhc_ethnicity, 
+                                #is.na(fhc_race_group) & fhc_ethnicity!='Non-Hispanic/Latino'~fhc_ethnicity,
+                                TRUE~NA),
+         ethnicity_final = case_when(fhc_ethnicity %in% ethnicity_strings~fhc_ethnicity, 
+                                     fhc_race_group %in% ethnicity_strings~fhc_race_group,
+                                     !is.na(fhc_ethnicity) & !fhc_ethnicity %in% ethnicity_strings &
+                                       ethnicity_count > 1~'Non-Hispanic/Latino',
+                                     !is.na(fhc_race_group) & !fhc_race_group %in% ethnicity_strings &
+                                       race_count > 1~'Non-Hispanic/Latino',
+                                     TRUE~NA)) 
+```
+
+```{r race_ethnic_summary, results='asis'}
+# look at cross-tab between race and ethnicity
+race_ethnic %>%
+  tableby(formula=~race_final+ethnicity_final, data=., test=FALSE) %>%
+  summary()
+```
+
+```{r multiple_races}
+multiple_races <- race_ethnic %>% 
+  select(pat_id, race_final) %>%
+  filter(!is.na(race_final)) %>%
+  distinct() %>%
+  group_by(pat_id) %>%
+  filter(n()>1) %>%
+  arrange(pat_id)
+```
+
+There are `r length(unique(multiple_races$pat_id))` patients who reported multiple races. The common combinations are: 
+
+```{r multiple_race_combos}
+multiple_races %>%
+  group_by(pat_id) %>%
+  mutate(num = row_number()) %>%
+  ungroup() %>%
+  pivot_wider(id_cols = 'pat_id', 
+              names_from = 'num', 
+              names_prefix = 'race_',
+              values_from = 'race_final') %>%
+  group_by(race_1, race_2, race_3, race_4) %>%
+  summarise(count=n(), .groups='drop') %>%
+  arrange(desc(count)) %>%
+  select(race_1, race_2, count) %>%
+  head(10) %>%
+  kable(caption = 'Top ten racial combinations of multiracial patients') %>% kable_styling()
+```
+
+```{r merge_race_ethnic}
+race_ethnic_new <- race_ethnic %>% 
+  group_by(pat_id) %>% 
+  filter(n()==1 | (n()>1 & !is.na(race_final))) %>% 
+  group_by(pat_id) %>%
+  summarise(race_groups = case_when(n_distinct(race_final)>1~paste0(unique(race_final),collapse = ', '),
+                                   TRUE~NA),
+            race_final = case_when(n_distinct(race_final)>1~'Multiple races',
+                                   n_distinct(race_final)==1~race_final,
+                                   TRUE~NA),
+            ethnicity_final = case_when(sum(!is.na(ethnicity_final))==1~ethnicity_final,
+                                        sum(!is.na(ethnicity_final))>1 & 
+                                          sum(ethnicity_final=='Hispanic/Latino')>=1~'Hispanic/Latino',
+                                        sum(!is.na(ethnicity_final))>1 & 
+                                          sum(ethnicity_final=='Hispanic/Latino')==0~'Non-Hispanic/Latino',
+                                   TRUE~NA),
+            .groups='drop') %>%
+  distinct() %>%
+  mutate(race_ethnic_final = case_when(ethnicity_final=='Hispanic/Latino'~ethnicity_final,
+                                       !is.na(race_final)~str_c('NH ', race_final))) 
+```
+
+### Hormonal Contraceptive Use
+
+Hormonal contraceptive (HC) use is defined as use of any form of hormonal contraceptive (IUD, pill, injectable, implant, patch, ring) at the time of baseline or close to the time of baseline (within one year). The two sources for HC use are (1) indication of some type of HC use in the social baseline table or (2) diagnosis code for prescription for or surveillance of HC. Both of these are ONLY positive indicators of HC use. This means we will likely have many false negatives by missing indication of HC use if they are not prescribed at NYU and not recorded in the social baseline survey for patients. 
+
+We take any positive indication from either source to count. Positive indication for each is defined as: 
+
+- social baseline survey: (1) is their index encounter between the start/check-up date for an HC and another HC social history indicator? or (2) in the year after baseline encounter, do they have any true HC screen? This means at some point in the baseline year following entry into cohort they used a HC. 
+- diagnosis codes: (1) is their index encounter between the start/check-up date for an HC and another HC encounter (of any type)? or (2) in the year after baseline encounter, do they have any encounter for HC (this includes starting, continuing or ending HC use)? This means at some point in the baseline year following entry into cohort they used a HC. 
+
+```{r hc_social_clean}
+hc_social_clean <- hc_use_social %>% 
+  inner_join(pat_cohort %>% select(pat_id, index_enc_date), by='pat_id') %>%
+  mutate(contact_date = as.Date(contact_date), index_enc_date = as.Date(index_enc_date)) %>%
+  group_by(pat_id) %>%
+  mutate(next_hc_enc = lead(contact_date),
+         HC_status = case_when((index_enc_date >= contact_date & index_enc_date <= next_hc_enc)~TRUE,
+                               between(as.numeric(contact_date-index_enc_date), 0, 365) ~ TRUE,
+                               TRUE~FALSE),
+         source = 'social_history')
+#length(unique(hc_social_clean$pat_id[which(hc_social_clean$HC_status)]))
+```
+
+```{r hc_dx_clean}
+hc_dx_clean <- hc_use_dx %>% 
+  inner_join(pat_cohort %>% select(pat_id, index_enc_date), by='pat_id') %>%
+  mutate(dx_date = as.Date(dx_date), index_enc_date = as.Date(index_enc_date)) %>%
+  arrange(pat_id, dx_date) %>%
+  mutate(HC_enc_type = case_when(grepl('Z30.432', icd10)~'end',
+                                 grepl('Z30.433', icd10)~'continuation',
+                                 grepl('Z30.01(?:\\>|[1-9]\\>)|Z30.430', icd10)~'start',
+                                 grepl('Z30.4[0-3,4,5,6,9]\\>|Z30.431', icd10)~'checkup'),
+         hc_type = case_when(grepl('Z30.011|Z30.41', icd10)~'pill',
+                                grepl('Z30.014|Z30.43[0-3]', icd10)~'iud',
+                                grepl('Z30.013|Z30.42', icd10)~'injectable',
+                                grepl('Z30.015|Z30.44', icd10)~'ring',
+                                grepl('Z30.016|Z30.45', icd10)~'patch',
+                                grepl('Z30.017|Z30.46', icd10)~'implant',
+                                grepl('Z30.012', icd10)~'emergency',
+                                TRUE~'other')) %>% 
+  filter(hc_type != 'emergency') %>%
+  group_by(pat_id) %>%
+  mutate(next_hc_enc = lead(dx_date),
+         HC_status = case_when((index_enc_date >= dx_date & index_enc_date <= next_hc_enc) & HC_enc_type != 'end'~TRUE,
+                               between(as.numeric(dx_date-index_enc_date), 0, 365) ~ TRUE,
+                               TRUE~FALSE),
+         source = 'diagnosis_codes')
+```
+
+```{r, eval=FALSE}
+hc_dx_clean %>% 
+  group_by(pat_id) %>% 
+  filter(sum(HC_status)==0 & sum(year(dx_date)==year(index_enc_date))>=1) %>%
+  select(-pat_enc_csn_id, -dx_type, -referral_id) %>%
+  View()
+
+hc_dx_clean %>% 
+  group_by(pat_id) %>% 
+  filter(HC_status) %>%
+  select(-pat_enc_csn_id, -dx_type, -referral_id) %>%
+  View()
+
+## based on both sources how many contraceptive users should there be
+length(unique(c(hc_dx_clean$pat_id[which(hc_dx_clean$HC_status)], hc_social_clean$pat_id[which(hc_social_clean$HC_status)])))
+```
+
+```{r hc_join}
+hc_all_baseline <- hc_social_clean %>% 
+  filter(HC_status) %>%
+  select(pat_id, HC_status, hc_type) %>%
+  bind_rows(hc_dx_clean %>% 
+              filter(HC_status) %>% 
+              select(pat_id, HC_status, hc_type, source)) %>% 
+  distinct() %>%
+  group_by(pat_id) %>%
+  # remove duplicates where the type is other or emergency in favor of the duplicate which is not that
+  filter(n()==1 | (n()>1 & !hc_type %in% c('other', 'emergency'))) %>%
+  summarise(HC_status = case_when(sum(HC_status) >= 1~TRUE,
+                                  n() == sum(!HC_status)~FALSE),
+            HC_type = paste0(unique(hc_type[HC_status]), collapse = ', '),
+            .groups='drop')
+```
+
+### {.unnumbered}
+
+## 2: Explore Distributions of covariates {.tabset}
+
+### Healthcare Utilization
+
+Overall, we can extract HCU at baseline for `r length(which(!is.na(pat_cohort$hcu_baseline)))` (`r print_percent(length(which(!is.na(pat_cohort$hcu_baseline)))/dim(pat_cohort)[1])`).
+
+```{r hcu_table, results='asis'}
+summary(tableby(data=pat_cohort, formula = ~hcu_baseline+hcu_fu))
+```
+
+```{r hcu_fig}
+pat_cohort %>% 
+  select(pat_id, hcu_baseline, hcu_fu) %>%
+  pivot_longer(cols=c('hcu_baseline', 'hcu_fu'), names_to = 'hcu_type', values_to = 'num_enc') %>%
+  ggplot(., aes(x=num_enc, fill=hcu_type)) + 
+  geom_histogram(binwidth=1) +
+  facet_wrap(~hcu_type) + 
+  theme_bw()
+```
+
+### Employment Status
+
+Overall, we can extract employment status at baseline for `r length(unique(employment_final$pat_id))` (`r print_percent(length(unique(employment_final$pat_id))/dim(pat_cohort)[1])`).
+
+```{r empy_table, results='asis'}
+summary(tableby(data=employment_final, formula = ~emply_final+empy_status_new+empy_status_baseline))
+```
+
+### Insurance Status
+
+```{r insurance_table}
+
+```
+
+
+### ART Use
+
+Overall, we can extract preferred langauge for `r length(unique(ART_use_new$pat_id))` (`r print_percent(length(unique(ART_use_new$pat_id))/dim(pat_cohort)[1])`).
+
+```{r ART_table, results='asis'}
+summary(tableby(data=ART_use_new, formula = ~ART_use_baseline+ART_use_fu))
+```
+
+### Race/ethnicity
+
+Overall, we can extract race and ethnicity for `r length(which(!is.na(race_ethnic_new$race_ethnic_final)))` (`r print_percent(length(which(!is.na(race_ethnic_new$race_ethnic_final)))/dim(pat_cohort)[1])`).
+
+```{r race_ethnic_table, results='asis'}
+race_ethnic_new %>% 
+  tableby(formula=~race_ethnic_final+race_final+ethnicity_final, data=.) %>% 
+  summary()
+```
+
+This is a cross-tabulation of race and ethnicity if we do not merge the two variables. 
+
+```{r race_ethnic_crosstab, results='asis'}
+# look at cross-tab between race and ethnicity
+race_ethnic_new %>%
+  tableby(formula=ethnicity_final~race_final, data=., test=FALSE) %>%
+  summary()
+```
+
+### Age
+
+Overall, we can extract age for `r length(which(!is.na(pat_cohort$age_20160801)))` (`r print_percent(length(which(!is.na(pat_cohort$age_20160801)))/dim(pat_cohort)[1])`).
+
+```{r age_table, results='asis'}
+summary(tableby(data=pat_cohort, formula = ~age_20160801,
+                numeric.stats=c('mean', 'median', 'q1q3', 'Nmiss')))
+```
+
+### Parity
+
+```{r clean_parity}
+covars$parity_final <- coalesce(covars$ob_parity, covars$ob_live_births)
+covars$parity_final <- ifelse(covars$ob_full_term == 0 & is.na(covars$parity_final), 0,
+                              covars$parity_final)
+```
+
+Overall, we can extract parity for `r length(unique(covars$pat_id[which(!is.na(covars$parity_final))]))` (`r print_percent(length(unique(covars$pat_id[which(!is.na(covars$parity_final))]))/dim(pat_cohort)[1])`).
+
+The table below shows the distribution of parity in our sample at baseline. The obstetrics history table for patients included a variable for parity and live births. The combination of both was used to infer parity. There is also a full term variable in the obstetrics history table. While a full term pregnancy cannot be assumed to be a live birth, the lack of a full term pregnancy can be inferred to mean 0 live births. Therefore, if a patient was missing parity information but had a full term value of 0, their parity was set to 0. 
+
+```{r parity_table}
+covars %>% 
+  select(pat_id, parity_final, contains('ob')) %>% 
+  distinct() %>% 
+  tableby(data=.,  
+          formula =~parity_final+ob_parity+ob_full_term+ob_live_births, 
+          numeric.stats=c('mean', 'median', 'q1q3', 'Nmiss')) %>%
+  summary()
+```
+
+### Preferred Language
+
+```{r clean_lang}
+language <- covars %>% 
+  select(pat_id, contains('language'), intrptr_needed_yn) %>% 
+  distinct() %>%
+  mutate(language = coalesce(language_prefer, language_care, language_writ)) %>%
+  mutate(language = ifelse(grepl('DO NOT USE', language), NA, language)) %>%
+  mutate(language_eng = case_when(language == 'English'~language, 
+                                  intrptr_needed_yn == 'Y'~'Non-English',
+                                  !is.na(language)~'Non-English'), 
+         language_eng = factor(language_eng))
+```
+
+Overall, we can extract preferred language for `r length(unique(language$pat_id[which(!is.na(language$language_eng))]))` (`r print_percent(length(unique(language$pat_id[which(!is.na(language$language_eng))]))/dim(pat_cohort)[1])`).
+
+
+```{r english_only, results='asis'}
+summary(tableby(data=language, formula = ~language_eng))
+```
+
+```{r top_languages}
+language %>%
+  group_by(language) %>%
+  summarise(count=n(), .groups='drop') %>%
+  arrange(desc(count)) %>%
+  head(10) %>%
+  kable(caption = 'Top ten languages in patient cohort') %>% 
+  kable_styling()
+```
+
+### Marital status
+
+```{r clean_marital}
+marital_baseline <- marital %>% 
+  left_join(pat_cohort %>% select(pat_id, index_enc_date), by='pat_id') %>%
+  mutate(margin = difftime(change_time, index_enc_date, unit='days'),
+         old_marital_status = case_when(grepl('NULL|Unknown', old_marital_status)~NA,
+                                        TRUE~old_marital_status),
+         new_marital_status = case_when(grepl('NULL|Unknown', new_marital_status)~NA,
+                                        TRUE~new_marital_status),) %>%
+  group_by(pat_id) %>%
+  filter(min(abs(margin)) == abs(margin)) %>%
+  ungroup() %>%
+  # if either is missing take the one that isn't missing, otherwise take according to date
+  mutate(marital_status_baseline = case_when(is.na(old_marital_status) |
+                                               is.na(new_marital_status)~
+                                               coalesce(new_marital_status, old_marital_status),
+                                             index_enc_date < change_time~old_marital_status, 
+                                             index_enc_date >= change_time~new_marital_status))
+```
+
+Overall, we can extract marital status at baseline for `r length(unique(marital_baseline$pat_id[which(!is.na(marital_baseline$marital_status_baseline))]))` (`r print_percent(length(unique(marital_baseline$pat_id[which(!is.na(marital_baseline$marital_status_baseline))]))/dim(pat_cohort)[1])`).
+
+```{r marital_table, results='asis'}
+summary(tableby(data=marital_baseline, ~marital_status_baseline))
+```
+
+
+### Hormonal contraceptive use
+
+Overall, we can found positive indication for HC use at baseline for `r length(unique(hc_all_baseline$pat_id))` patients (`r print_percent(length(unique(hc_all_baseline$pat_id))/dim(pat_cohort)[1])`). We assume if they do NOT have positive indication of HC use at baseline than they were not using HC at baseline (this likely underestimates the true rate and has high false negative rate).
+
+This table shows the number of patients at baseline who were on some form of hormonal contraceptive and the methods of contraceptive used. Some patients indicated multiple methods so they may sum to more than 100% of the patients with `HC_status=TRUE`.
+
+```{r hc_table, results='asis'}
+hc_all_baseline %>%
+  mutate(iud = ifelse(grepl('iud', HC_type), TRUE, FALSE),
+         pill = ifelse(grepl('pill', HC_type), TRUE, FALSE),
+         other = ifelse(grepl('implant|injection|ring|patch', HC_type), TRUE, FALSE)) %>%
+  tableby(formula = ~iud+pill+other, data=.) %>%
+  summary()
+```
+
+### Nativity/Immigration Status
+
+```{r clean_nativity}
+nativity <- covars %>% 
+  select(pat_id, country_of_origin, us_citizen_yn, permanent_resident_yn) %>%
+  mutate(across(us_citizen_yn:permanent_resident_yn, ~as.factor(.)),
+         country_of_origin_clean = ifelse(grepl('Refused|Unknown', country_of_origin), NA,
+                                          country_of_origin),
+         nativity = case_when(country_of_origin_clean != 'United States of America'~'non-US',
+                              permanent_resident_yn == 'Y' ~ 'non-US', 
+                              us_citizen_yn == 'N' ~ 'non-US', 
+                              country_of_origin_clean == 'United States of America'~'US', 
+                              TRUE~NA),
+         nativity = as.factor(nativity)) %>%
+  distinct()
+```
+
+`r length(unique(covars$pat_id[which(!is.na(covars$country_of_origin))]))` patients report a country of origin in their EHR. `r length(unique(covars$pat_id[which(!is.na(covars$permanent_resident_yn))]))` patients report a permanent resident status in their EHR. `r length(unique(covars$pat_id[which(!is.na(covars$us_citizen_yn))]))` patients report a citizenship status in their EHR. 
+
+Overall, we can extract nativity for `r length(which(!is.na(nativity$nativity)))` (`r print_percent(length(which(!is.na(nativity$nativity)))/dim(pat_cohort)[1])`)
+
+```{r nativity_summary, results='asis'}
+summary(tableby(data=nativity, formula=~nativity))
+```
+
+### BMI
+
+```{r clean_bmi}
+bmi_clean <- enc_info_baseline %>% 
+  select(pat_id, bmi, enc_date) %>%
+  distinct() %>%
+  mutate(bmi_clean = as.numeric(bmi),
+         bmi_clean = case_when(bmi_clean>10000~bmi_clean/1000,
+                               bmi_clean>1000~bmi_clean/100,
+                               bmi_clean>100~bmi_clean/10,
+                               TRUE~bmi_clean)) %>%
+  filter(!is.na(bmi_clean)) %>%
+  inner_join(pat_cohort %>% select(pat_id, index_enc_date), by='pat_id') %>%
+  mutate(margin = difftime(enc_date, index_enc_date, unit='days')) %>%
+  group_by(pat_id) %>%
+  filter(min(abs(margin)) == abs(margin)) %>%
+  ungroup() 
+```
+
+There are `r length(unique(bmi_clean$pat_id))` patients with a clean BMI at baseline which is `r print_percent(length(unique(bmi_clean$pat_id))/dim(pat_cohort)[1])`. Some patients have more than one BMI at baseline so I take the average of these values to derive their baseline BMI. 
+
+```{r baseline_bmi}
+bmi_final <- bmi_clean %>% 
+  group_by(pat_id) %>% 
+  arrange(pat_id) %>%
+  summarise(bmi_baseline = mean(bmi_clean), 
+            .groups='drop')
+```
+
+```{r bmi_table, results='asis'}
+summary(tableby(data=bmi_final, 
+                formula=~bmi_baseline, 
+                numeric.stats=c('mean', 'median', 'q1q3', 'Nmiss')))
+```
+
+```{r bmi_histogram}
+ggplot(bmi_final, aes(x=bmi_baseline)) +
+  geom_histogram(fill='lightpink', color='white', binwidth = 1) + 
+  theme_bw()
+```
+
+### {.unnumbered}
+
+## 3: Explore Missingness of covariates {.tabset}
+
+
+
+```{r}
+## write out final table with covariates
+```
