@@ -70,7 +70,7 @@ length(unique(res_his_unique$pat_id[which(!substr(res_his_unique$full_fips_tract
 table(substr(res_his_unique$full_fips_tract_final, 1, 5))
 # filter to only those with a nyc county fips
 length(unique(res_his_unique$pat_id[which(substr(res_his_unique$full_fips_tract_final, 1, 5) %in% nyc_counties$`State County fips`)]))
-# 101969 patients
+# 80307 patients
 
 ################################################################################
 # Look for baseline address #####################################################
@@ -79,7 +79,7 @@ length(unique(res_his_unique$pat_id[which(substr(res_his_unique$full_fips_tract_
 res_his_unique <- left_join(res_his_unique, pat_cohort[c("pat_id", "index_enc_date")], by="pat_id")
 # how many patients have an address prior to their index encounter
 length(unique(res_his_unique$pat_id[which(res_his_unique$eff_start_date_min <= res_his_unique$index_enc_date)]))
-# 81453
+# 80440
 
 ## define baseline address
 res_his_baseline <- res_his_unique %>%
@@ -111,7 +111,7 @@ res_his_baseline <- res_his_baseline %>%
                                    TRUE~baseline_addr)) %>%
   ungroup()
 
-length(unique(res_his_baseline$pat_id[which(res_his_baseline$baseline_addr)])) ## all but 3 patients
+length(unique(res_his_baseline$pat_id[which(res_his_baseline$baseline_addr)])) ## all but 1 patients
 
 ################# FILTER TO BASELINE ADDRESS
 
@@ -127,7 +127,7 @@ table(substr(res_his_baseline_unique$full_fips_tract_final, 1, 2))
 # the most populous are NY, NJ, PA, CT and to a lesser extent CA, MA, MD, DC and GA
 length(which(!substr(res_his_baseline_unique$full_fips_tract_final, 1, 2) %in% c(36, 09, 34, 42)))
 length(unique(res_his_baseline_unique$pat_id[which(!substr(res_his_baseline_unique$full_fips_tract_final, 1, 2) %in% c(36, 09, 34, 42))]))
-# around 14911 are not from NY
+# around 495 are not from NY
 # look at only NYC counties
 table(substr(res_his_baseline_unique$full_fips_tract_final, 1, 5))
 # filter to only those with a nyc county fips
@@ -146,7 +146,7 @@ res_his_baseline_unique <- res_his_baseline_unique %>%
 ################# FILTER TO ADDRESSES WITH SUFFICIENT ACCURACY SCORE
 
 # look at accuracy score of patients with baseline census tracts
-length(which(res_his_baseline_unique$max_accuracy_score < 0.6)) #1813
+length(which(res_his_baseline_unique$max_accuracy_score < 0.6)) #1788
 # for those with low accuracy look at their other address
 res_his %>%
   filter(pat_id %in% unique(res_his_baseline_unique$pat_id[which(res_his_baseline_unique$max_accuracy_score < 0.6)])) %>%

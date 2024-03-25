@@ -89,26 +89,29 @@ nyc_geo2017 <- nyc_metro_geo %>%
   
 # join all together
 df_tract <- nyc_geo2017 %>%
-  left_join(res_his %>% 
+  left_join(res_his %>%
+              filter(pat_id %in% pat_cohort$pat_id) %>% 
               group_by(full_fips_tract_final) %>%
               summarise(count=n(), .groups='drop') %>%
               mutate(GEOID=as.character(full_fips_tract_final)), 
             by='GEOID') %>% 
   separate(NAME, into = c(NA, "name"), sep = ", ") %>%
-  left_join(gent_index_sub, by='GEOID')
+  left_join(gent_index_sub, by='GEOID') 
   
 
 # join all together
 df_nta <- my_sf %>%
   left_join(res_his %>%
+              filter(pat_id %in% pat_cohort$pat_id) %>%
               mutate(GEOID=as.character(full_fips_tract_final)) %>% 
               left_join(gent_index_sub, by='GEOID') %>%
               group_by(NTAName) %>%
               summarise(count=n(), .groups='drop'), 
-            by='NTAName')
+            by='NTAName') 
   
 # participant level data
 df_cohort <- res_his %>%
+  filter(pat_id %in% pat_cohort$pat_id) %>%
   mutate(GEOID=as.character(full_fips_tract_final)) %>%
   left_join(nyc_geo2017, by='GEOID') %>%
   separate(NAME, into = c(NA, "name"), sep = ", ") %>%
