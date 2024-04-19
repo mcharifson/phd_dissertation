@@ -1,5 +1,5 @@
 ---
-title: "Defining Incident Endo from NYULH EHR"
+title: "Step 2.02: Defining Incident Endo from NYULH EHR"
 author: "Mia Charifson"
 date: "2024-03-15"
 output: 
@@ -31,12 +31,12 @@ Last updated on `r lubridate::today()`.
 Load in all tables
 ```{r load}
 pat_cohort <- read.csv('Data/Derived/pat_cohort_w_censoring.csv') 
-uf_endo <- read.csv('Data/Epic/table3_dx_outcomes_new_20240304.csv')
-uf_endo_filled_dates <-read.csv('Data/Epic/table3_dx_outcomes_date_filled_20240304.csv')
+uf_endo <- read.csv('Data/Epic/table3_dx_outcomes.csv')
+uf_endo_filled_dates <-read.csv('Data/Epic/fill_missing_dx_dates.csv')
 imaging_dx <- read.csv('Data/Epic/table3_dx_imaging.csv') 
 imaging_orders <- read.csv('Data/Epic/table4_proc_imaging.csv') 
 surgery_orders <- read.csv('Data/Epic/table4_proc_surgery.csv') 
-surgery_records <- read.csv('Data/Epic/table4_surgery_surgical_dx.csv')
+surgery_records <- read.csv('Data/Epic/table4_surgery.csv')
 ```
 
 Subset tables to the eligible cohort
@@ -96,6 +96,7 @@ endo_codes <- 'N80|N97.2|IMO0002|NULL'
 
 endo_dx_unique <- uf_endo_cohort %>% 
   filter(!is.na(dx_date)) %>%
+  filter(dx_date <= '2023-08-01') %>% # filter to end of FU
   filter(grepl(endo_codes, icd10) & !grepl('N80.03', icd10) & !grepl('adenomyosis', dx_name)) %>%
   rename(date=dx_date) %>%
   select(-referral_id, -icd10, -dx_date_filled, -pat_enc_csn_id) %>%
@@ -119,10 +120,21 @@ surgery_unique <- surgery_all %>%
             .groups='drop')
 ```
 
+```{r check_dx_names, eval=FALSE, include=FALSE}
+## check fibroid dx_names
+uf_endo_cohort %>% 
+  filter(!is.na(dx_date)) %>%
+  filter(dx_date <= '2023-08-01') %>% # filter to end of FU
+  filter(grepl(endo_codes, icd10) & !grepl('N80.03', icd10) & !grepl('adenomyosis', dx_name)) %>%
+  distinct(dx_name) %>% 
+  View()
+```
+
 Bind all inputs together
 ```{r final_inputs}
 endo_all_long <- bind_rows(endo_dx_unique, imaging_unique, surgery_unique) %>%
   distinct() %>%
+  filter(date <= '2023-08-01') %>% # filter to end of FU
   arrange(pat_id, date)
 
 endo_pat_unique <- endo_dx_unique %>% distinct(pat_id)
@@ -147,6 +159,7 @@ Extract variables
 ```{r endo_first_dx}
 endo_first_dx <- uf_endo_cohort %>% 
   filter(!is.na(dx_date)) %>%
+  filter(dx_date <= '2023-08-01') %>% # filter to end of FU
   filter(grepl(endo_codes, icd10) & !grepl('N80.03', icd10) & !grepl('adenomyosis', dx_name)) %>%
   group_by(pat_id) %>%
   filter(dx_date==min(dx_date)) %>%
@@ -337,9 +350,7 @@ procedure_hints <- procedure_df %>%
             prevalent_dx_after_proc = (sum(confirmed_ever_prevalent, na.rm=TRUE)>0),
             imaging_confirmed = (sum(confirmed_6months & method == 'Imaging', na.rm=TRUE)>0),
             surgery_confirmed = (sum(confirmed_6months & method == 'Surgery', na.rm=TRUE)>0),
-            first_confirm_date = min(date[which(confirmed_6months |
-                                                            confirmed_ever_prevalent)], 
-                                               na.rm=TRUE),
+            first_confirm_date = min(date[which(confirmed_6months)], na.rm=TRUE),
             .groups = 'drop')
 ## add in first confirmation type
 procedure_hints <- procedure_hints %>%
@@ -349,11 +360,35 @@ procedure_hints <- procedure_hints %>%
               filter(confirmed_6months) %>%
               select(pat_id, method, date), 
             by=c('pat_id', 'first_confirm_date' = 'date')) %>%
-  rename(first_confirm_type = method) %>%
-  filter(pat_id %in% endo_pat_unique$pat_id)
+  group_by(pat_id) %>%
+  mutate(first_confirm_type = case_when(n()>1~'both',
+                                        TRUE~method)) %>%
+  select(-method) %>%
+  filter(pat_id %in% endo_pat_unique$pat_id) %>%
+  distinct()
   
-summary(procedure_hints)
-table(procedure_hints$first_confirm_type)
+#summary(procedure_hints)
+#table(procedure_hints$first_confirm_type)
+```
+Among those who are eventually confirmed, what is the distribution of time to first confirmation (between the first Dx date and the first Dx that was confirmed via imaging/surgery)?
+```{r time_to_confirm_fig}
+procedure_hints %>%
+  left_join(endo_first_dx %>% select(pat_id, first_dx_date), by='pat_id') %>%
+  filter(ever_confirmed_6months) %>%
+  mutate(time_to_confirmation = difftime(first_confirm_date, first_dx_date, units='days')) %>%
+  ggplot(data=., aes(x=time_to_confirmation, fill=first_confirm_type)) +
+  xlab('Time between First Dx and First Confirmed Dx code (days)') +
+  geom_histogram(binwidth = 30) +
+  facet_wrap(~first_confirm_type, scales = 'free_y') +
+  theme_bw()
+```
+
+```{r time_to_confirm_table}
+procedure_hints %>%
+  left_join(endo_first_dx %>% select(pat_id, first_dx_date), by='pat_id') %>%
+  filter(ever_confirmed_6months) %>%
+  mutate(time_to_confirmation = as.numeric(difftime(first_confirm_date, first_dx_date, units='days'))) %>%
+  CreateTableOne(vars='time_to_confirmation', strata = 'first_confirm_type', data=.)
 ```
 
 ## Meta-diagnosis information
@@ -362,16 +397,25 @@ Location of the fibroid & first date of first location Dx
 ```{r location}
 # extract location of the Endo based on Dx name if that exists
 endo_loc_names <- 'bladder|cervical|ovar|tub|perito|umbilic|uterus|of|in'
-procedure_df$location <- grepl(endo_loc_names, tolower(procedure_df$event_name))
-## add to other hints
-other_hints <- endo_pat_unique %>%
-  left_join(procedure_df %>%
-              group_by(pat_id) %>%
-              summarise(any_location = (sum(location)>0),
-                        first_location_date = min(date[which(location)], na.rm=TRUE)),
-            by='pat_id') %>%
-  mutate(first_location_date = case_when(is.infinite(first_location_date)~NA,
-                                             TRUE~first_location_date))
+location_df <- procedure_df %>%
+  filter(grepl('History|List|Diagnosis', event_type) & !grepl('Imaging', event_type)) %>%
+  mutate(location = (grepl(endo_loc_names, tolower(event_name)))) %>%
+  group_by(pat_id) %>%
+  arrange(date) %>%
+  summarise(any_location = (sum(location)>0),
+            first_location_date = first(date[which(location)])) %>%
+  filter(pat_id %in% endo_pat_unique$pat_id)
+```
+
+Diagnosis mentions that it was determined via laparoscopy
+```{r dx_via_laparo}
+# extract instances where the diagnosis mentioned laparoscopic confirmation
+dx_via_laparo <- endo_dx_unique %>%
+  filter(pat_id %in% endo_pat_unique$pat_id) %>%
+  group_by(pat_id) %>%
+  mutate(dx_via_laparoscopy = sum(grepl('determined by', event_name))>0) %>%
+  ungroup() %>%
+  distinct(pat_id, dx_via_laparoscopy)
 ```
 
 Historical diagnosis close to fist diagnosis date
@@ -385,12 +429,17 @@ endo_hx_code <- uf_endo_cohort %>%
              by='pat_id') %>%
   mutate(hx_code_margin = difftime(first_hx_code, first_dx_date, unit='days'),
          confident_prevalent = (hx_code_margin<=60))
+```
 
-# join to other hints
-other_hints <- other_hints %>%
+```{r other_hints}
+other_hints <- endo_pat_unique %>%
+  left_join(location_df, by='pat_id') %>%
+  left_join(dx_via_laparo, by='pat_id') %>%
+  mutate(dx_via_laparoscopy = ifelse(is.na(dx_via_laparoscopy), FALSE, dx_via_laparoscopy)) %>%
   left_join(endo_hx_code %>% select(pat_id, confident_prevalent), 
             by='pat_id')
 ```
+
 
 ## {.unnumbered}
 
@@ -417,7 +466,7 @@ names(endo_dx_hints)
 # only add up hints for incident cases
 bin_hints <- c('dx_after_partial_LTFU', 'has_imaging', 'has_surgery', 'ever_confirmed_6months', 
                'prevalent_dx_after_proc', 'imaging_confirmed', 'surgery_confirmed', 'any_location', 
-               'multiple_referral')
+               'multiple_referral', 'dx_via_laparoscopy')
 endo_dx_hints <- endo_dx_hints %>%
   mutate(number_pos_hints = rowSums(.[bin_hints], na.rm=TRUE)) %>%
   mutate(confident_incident = case_when(confident_prevalent~FALSE,
@@ -426,6 +475,7 @@ endo_dx_hints <- endo_dx_hints %>%
                                         prevalent_dx_after_proc~TRUE,
                                         dx_after_partial_LTFU~TRUE,
                                         multiple_referral~TRUE,
+                                        dx_via_laparoscopy~TRUE,
                                         TRUE~FALSE))
 ```
 
@@ -456,6 +506,52 @@ endo_dx_hints %>%
   theme_bw()
 ```
 
+Check data for date discrepancies
+```{r check_ns}
+# check for duplicates
+paste0('N duplicate patient IDs: ', length(which(duplicated(endo_dx_hints$pat_id))))
+
+# make sure all confirmations are within 180 days prior to first dx code
+paste0('N confirmation date >6 months before first dx date: ', length(which(difftime(endo_dx_hints$first_dx_date, endo_dx_hints$first_confirm_date, units='days') > 180)))
+
+# make sure all location dates are not earlier 
+paste0('N location date before first dx date: ',
+length(which(endo_dx_hints$first_dx_date > endo_dx_hints$first_location_date)))
+
+# check how many have location on the first date of diagnosis
+## these could be potentially prevalent diagnoses
+paste0('N location date on same day as first dx date but no confirmation: ',
+length(which(endo_dx_hints$first_dx_date == endo_dx_hints$first_location_date & 
+               (endo_dx_hints$first_confirm_date > endo_dx_hints$first_dx_date |
+                  is.na(endo_dx_hints$first_confirm_date)))))
+
+# check how many are confirmed and then first diagnosis code happens
+paste0('N confirmed before or on first dx date: ',
+       endo_dx_hints %>% 
+         filter(first_dx_date == first_confirm_date |
+                  difftime(first_dx_date, first_confirm_date, units='days') < 180) %>%
+  nrow())
+
+# check how many are confirmed and then first diagnosis code happens
+paste0('N with only one billing diagnosis: ',
+       endo_dx_hints %>% filter(dx_count == 1 & grepl('Hospital', first_dx_type)) %>% nrow())
+```
+```{r, eval=FALSE}
+# look into those with location on first dx date but no form of confirmation on same date
+endo_dx_hints %>% 
+  filter(first_location_date==first_dx_date & (first_confirm_date > first_dx_date | is.na(first_confirm_date))) %>%
+  left_join(pat_cohort %>% select(pat_id, pat_mrn_id), by ='pat_id') %>%
+  select(pat_mrn_id, pat_id:confident_incident) %>%
+  View()
+
+# look into those with only one billing diagnosis ever
+endo_dx_hints %>% 
+  filter(dx_count == 1 & grepl('Hospital', first_dx_type)) %>%
+  left_join(pat_cohort %>% select(pat_id, pat_mrn_id), by ='pat_id') %>%
+  select(pat_mrn_id, pat_id:confident_incident) %>%
+  View()
+```
+
 # 2.3. Define Endo outcome according to EHR phenotypes
 
 `Confident positive` is defined as a Endo diagnosis which has some combination of the following hints (in order of confidence):
@@ -484,6 +580,10 @@ endo_dx_hints %>%
 
 *Assumption: Patients who receive their first Endo Dx on the day they return to relevant care at NYU were likely diagnosed outside of NYU and return to NYU with the new incident diagnosis.*
 
+7. Has any diagnostic code which mentions being determined by laparoscopy
+
+*Assumption: Patients diagnosed via laparoscopy are true positive cases and the fact that this code is dropped is likely due to recent confirmation.*
+
 QUESTION: Should patients diagnosed DURING partial LTFU be included here? Based on dicussion with Anais, these could be encounter diagnoses dropped for the referral (forced by Epic) but is not a confirmed diagnosis.
 
 `Prevalent cases` can be identified via a historical diagnosis (Z86) code at or close (within 2 months) to first dx code
@@ -495,9 +595,9 @@ QUESTION: Should patients diagnosed DURING partial LTFU be included here? Based 
 ## Confident incident cases
 
 ```{r confident_incident_table}
-print(CreateTableOne(data=endo_dx_hints, includeNA=TRUE,
-               vars=c('confident_incident', 'ever_confirmed_6months', 'any_location',
-                      'prevalent_dx_after_proc','ever_pregnancy_related', 'multiple_referral',
+print(CreateTableOne(data=endo_dx_hints %>% filter(confident_incident), includeNA=TRUE,
+               vars=c('ever_confirmed_6months', 'any_location',
+                      'prevalent_dx_after_proc', 'multiple_referral', 'dx_via_laparoscopy',
                       'dx_after_partial_LTFU', 'confident_prevalent')),
       showAllLevels = TRUE)
 ```
@@ -576,13 +676,22 @@ For many of these cases, the surgery is the one used to diagnose fibroids, so th
 Add to patient cohort table with flag for case type: if they are censored before diagnosis (unless it is the surgery_confirmed case) then keep them as censored but otherwise use their first Dx date as their censor date
 ```{r}
 pat_cohort_endo <- pat_cohort %>%
+  left_join(procedure_df %>% 
+              filter(is_procedure) %>%
+              group_by(pat_id) %>%
+              summarise(ever_imaging = ifelse(sum(method == 'Imaging')>=1, TRUE, FALSE),
+                        ever_surgery = ifelse(sum(method == 'Surgery')>=1, TRUE, FALSE),
+                        .groups='drop'),
+            by='pat_id') %>%
   left_join(endo_dx_hints %>% 
               mutate(putative_group = case_when(confident_incident~'Incident case', 
                                                 !confident_incident~'Prevalent case or false positive')) %>%
               select(pat_id, first_dx_date, putative_group, first_confirm_date, first_confirm_type,
                      first_location_date),
             by='pat_id') %>%
-  mutate(endo_dx = case_when(!is.na(putative_group)~TRUE, TRUE~FALSE),
+  mutate(ever_imaging = case_when(is.na(ever_imaging)~FALSE, TRUE~ever_imaging),
+         ever_surgery = case_when(is.na(ever_surgery)~FALSE, TRUE~ever_surgery),
+         endo_dx = case_when(!is.na(putative_group)~TRUE, TRUE~FALSE),
          endo_before_censor = case_when(is.na(final_censor_date)~TRUE,
                                       first_dx_date <= final_censor_date~TRUE,
                                       TRUE~FALSE),
@@ -609,8 +718,7 @@ CreateTableOne(data=pat_cohort_endo, strata='endo_dx', includeNA=TRUE, addOveral
 Calculate person-time for cohort (including all cases)
 ```{r}
 pat_cohort_endo %>%
-  mutate(person_years = case_when(is.na(final_censor_date_endo_all)~difftime('2023-08-01',
-                                                                           index_enc_date,units='days'),
+  mutate(person_years = case_when(is.na(final_censor_date_endo_all)~difftime(last_enc_date, index_enc_date,units='days'),
                                   TRUE~difftime(final_censor_date_endo_all,index_enc_date,units='days')),
          person_years = as.numeric(person_years)/365.25) %>%
   summarise(total_person_time = sum(person_years),
@@ -621,8 +729,7 @@ Calculate person-time for cohort (only confident cases)
 ```{r}
 pat_cohort_endo %>%
   filter(putative_group != 'Prevalent case or false positive' | is.na(putative_group)) %>%
-  mutate(person_years = case_when(is.na(final_censor_date_endo_confident)~difftime('2023-08-01',
-                                                                           index_enc_date,units='days'),
+  mutate(person_years = case_when(is.na(final_censor_date_endo_confident)~difftime(last_enc_date, index_enc_date,units='days'),
                                   TRUE~difftime(final_censor_date_endo_confident,index_enc_date,units='days')),
          person_years = as.numeric(person_years)/365.25) %>%
   summarise(total_person_time = sum(person_years),
@@ -632,7 +739,7 @@ pat_cohort_endo %>%
 
 Save both dataframes (updated pat_cohort & all_endo_hints)
 ```{r save_files}
-write.csv(endo_dx_hints, 'Data/Derived/endo_all_hints_20240321.csv', row.names=FALSE)
-write.csv(pat_cohort_endo, 'Data/Derived/cohort_w_endo_20240321.csv', row.names=FALSE)
+write.csv(endo_dx_hints, 'Data/Derived/endo_all_hints.csv', row.names=FALSE)
+write.csv(pat_cohort_endo, 'Data/Derived/Chapter 1/cohort_w_endo.csv', row.names=FALSE)
 ```
 

@@ -1,4 +1,4 @@
--- !preview conn=DBI::dbConnect(RSQLite::SQLite())
+-- extract all education information for cohort
 
 select pat_id
 , pat_enc_csn_id

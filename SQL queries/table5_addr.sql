@@ -19,10 +19,11 @@ pat_id
 , full_fips_block_2010
 , accuracy_type
 , accuracy_score
+, ROW_NUMBER() OVER(ORDER BY 1) AS rownum
 from sr3452058_table5_addr
-order by eff_start_date --desc
+order by rownum
 limit 500000
--- limit 300000
+-- offset 5000000
 
 
 

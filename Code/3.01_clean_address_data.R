@@ -17,18 +17,18 @@ library(data.table)
 # load files
 pat_cohort <- read.csv('Data/Derived/pat_cohort_w_censoring.csv') 
 nyc_counties <- read_excel('Data/External/NY_NJ_PA_CT_county_fips.xlsx', 1)
-res_his1 <- read.csv('Data/Epic/table5_addr_top.csv')
-res_his2 <- read.csv('Data/Epic/table5_addr_bottom.csv')
+res_his1 <- read.csv('Data/Epic/table5_addr1.csv')
+res_his2 <- read.csv('Data/Epic/table5_addr2.csv')
 
 # join together the files 
 res_his <- bind_rows(res_his1, res_his2) %>% distinct()
-length(which(!pat_cohort$pat_id %in% res_his$pat_id)) # 3 patients have no address data
+length(which(!pat_cohort$pat_id %in% res_his$pat_id)) # 36 patients have no address data
 
 # subset to patients in the cohort
 res_his <- res_his %>% 
   filter(pat_id %in% pat_cohort$pat_id) %>% 
   arrange(pat_id, eff_start_date, eff_end_date)
-length(unique(res_his$pat_id)) # here we see the 4 patients with no address data
+length(unique(res_his$pat_id)) # here we see the 36 patients with no address data missing
 
 # select the correct GEOID for the year of the address
 res_his <- res_his %>%
@@ -70,7 +70,7 @@ length(unique(res_his_unique$pat_id[which(!substr(res_his_unique$full_fips_tract
 table(substr(res_his_unique$full_fips_tract_final, 1, 5))
 # filter to only those with a nyc county fips
 length(unique(res_his_unique$pat_id[which(substr(res_his_unique$full_fips_tract_final, 1, 5) %in% nyc_counties$`State County fips`)]))
-# 80307 patients
+# 81905 patients
 
 ################################################################################
 # Look for baseline address #####################################################
@@ -79,7 +79,7 @@ length(unique(res_his_unique$pat_id[which(substr(res_his_unique$full_fips_tract_
 res_his_unique <- left_join(res_his_unique, pat_cohort[c("pat_id", "index_enc_date")], by="pat_id")
 # how many patients have an address prior to their index encounter
 length(unique(res_his_unique$pat_id[which(res_his_unique$eff_start_date_min <= res_his_unique$index_enc_date)]))
-# 80440
+# 81877
 
 ## define baseline address
 res_his_baseline <- res_his_unique %>%
@@ -111,7 +111,7 @@ res_his_baseline <- res_his_baseline %>%
                                    TRUE~baseline_addr)) %>%
   ungroup()
 
-length(unique(res_his_baseline$pat_id[which(res_his_baseline$baseline_addr)])) ## all but 1 patients
+length(unique(res_his_baseline$pat_id[which(res_his_baseline$baseline_addr)])) ## 70 patients
 
 ################# FILTER TO BASELINE ADDRESS
 
