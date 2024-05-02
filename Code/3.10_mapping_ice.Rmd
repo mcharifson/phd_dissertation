@@ -55,7 +55,7 @@ load("Data/External/ACS_ICE_RI_2016_2022_w_geography.RData")
 # Read this shape file with the rgdal library. 
 
 my_spdf <- readOGR( 
-  dsn= "nynta2020_23d", 
+  dsn= "Data/External/nynta2020_23d", 
   layer="nynta2020",
   verbose=FALSE
 )
@@ -135,12 +135,19 @@ res_his %>%
 
 ## Cohort Geographic Characteristics {.tabset}
 
-There are `r length(unique(nyc_geo2017$NAME))` census tracts in NY-Newark Combined Statistical Area in 2017. This includes the greater NYC metropolitan area and surrounding counties from NY, NJ, CT and PA. Of those census tracts, our cohort population has patients from `r length(unique(res_his$census_tract_final))` census tracts.
+There are `r length(unique(nyc_geo2017$NAME))` census tracts in NY-Newark Combined Statistical Area in 2017. This includes the greater NYC metropolitan area and surrounding counties from NY, NJ, CT and PA. Of those census tracts, our cohort population has patients from `r length(unique(res_his$census_tract_final))` census tracts. The number of patients in the 5 NYC boroughs is `r length(which(grepl('Bronx|Kings|Richmond|Queens|New York', df_cohort$name)))`
 
 The map below shows the count of cohort patients per census tract.
 
-### Maps
+```{r state_table, results='asis'}
+# percent of cohort by state
+```
 
+```{r nyc_table, results='asis'}
+# percent of cohort by borough or outside NYC
+```
+
+### Maps
 
 Maps constructed using this guide[https://r-charts.com/spatial/proportional-symbol-map-ggplot2/].
 
@@ -202,7 +209,7 @@ p1 <- df_tract %>%
   theme_void()
 
 p2 <- df_tract %>%
-  filter(grepl('Bronx|Kings|Rickmond|Queens|New York', name)) %>%
+  filter(grepl('Bronx|Kings|Richmond|Queens|New York', name)) %>%
   ggplot() + 
   geom_sf(aes(fill = count)) +
   coord_sf(crs = st_crs(df_tract), datum = NA) + 
@@ -263,7 +270,7 @@ ggarrange(p1, p2, nrow=1, common.legend = TRUE, legend = 'bottom')
 
 ```{r ice_maps_nyc, out.width='100%'}
 p1 <- df_tract %>%
-  filter(grepl('Bronx|Kings|Rickmond|Queens|New York', name)) %>%
+  filter(grepl('Bronx|Kings|Richmond|Queens|New York', name)) %>%
   ggplot() + 
   geom_sf(aes(fill = ICE_RI)) +
   coord_sf(crs = st_crs(df_tract), datum = NA) + 
@@ -273,7 +280,7 @@ p1 <- df_tract %>%
 
 p2 <- df_tract %>%
   filter(count > 0) %>%
-  filter(grepl('Bronx|Kings|Rickmond|Queens|New York', name)) %>%
+  filter(grepl('Bronx|Kings|Richmond|Queens|New York', name)) %>%
   ggplot() + 
   geom_sf(aes(fill = ICE_RI)) +
   coord_sf(crs = st_crs(df_tract), datum = NA) + 
@@ -313,7 +320,7 @@ Note: the gentrification index is only for NYC boroughs so it cannot be mapped f
 
 ```{r gentrification_maps_nyc, out.width='100%'}
 p1 <- df_tract %>%
-  filter(grepl('Bronx|Kings|Rickmond|Queens|New York', name)) %>%
+  filter(grepl('Bronx|Kings|Richmond|Queens|New York', name)) %>%
   ggplot() +
   geom_sf(aes(fill = gent_index)) +
   coord_sf(crs = st_crs(df_tract), datum = NA) + 
@@ -324,7 +331,7 @@ p1 <- df_tract %>%
 
 p2 <- df_tract %>%
   filter(count > 0) %>%
-  filter(grepl('Bronx|Kings|Rickmond|Queens|New York', name)) %>%
+  filter(grepl('Bronx|Kings|Richmond|Queens|New York', name)) %>%
   ggplot() + 
   geom_sf(aes(fill = gent_index)) +
   coord_sf(crs = st_crs(df_tract), datum = NA) + 
@@ -365,6 +372,7 @@ Below we calculate the weighted overall ICE-RI exposure, where weights represent
 
 ```{r}
 overall_weighted_res_his <- res_his_weights %>%
+  mutate(full_fips_tract_final = as.character(full_fips_tract_final)) %>%
   # give a minimum of 1 month for each census tract
   mutate(length_residence_months = ifelse(length_residence_months==0, 1,
                                           length_residence_months)) %>%

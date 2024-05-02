@@ -22,7 +22,7 @@ res_his2 <- read.csv('Data/Epic/table5_addr2.csv')
 
 # join together the files 
 res_his <- bind_rows(res_his1, res_his2) %>% distinct()
-length(which(!pat_cohort$pat_id %in% res_his$pat_id)) # 36 patients have no address data
+length(which(!pat_cohort$pat_id %in% res_his$pat_id)) # 33 patients have no address data
 
 # subset to patients in the cohort
 res_his <- res_his %>% 
@@ -32,6 +32,7 @@ length(unique(res_his$pat_id)) # here we see the 36 patients with no address dat
 
 # select the correct GEOID for the year of the address
 res_his <- res_his %>%
+  mutate(across(where(is.character), ~na_if(., "NULL"))) %>%
   mutate(eff_start_date = as.Date(eff_start_date), 
          eff_end_date = as.Date(eff_end_date), 
          census_tract_final = ifelse(year(eff_start_date)<2020, 
@@ -58,8 +59,7 @@ summary(res_his_unique$max_accuracy_score)
 length(which(res_his_unique$max_accuracy_score < 0.8))/dim(res_his_unique)[1] #5% are low accuracy
 length(unique(res_his_unique$pat_id))
 
-write.csv(res_his_unique, 'Data/Derived/all_cohort_addresses.csv', row.names=FALSE)
-#res_his_unique <- read.csv('Data/Derived/all_cohort_addresses.csv')
+write.csv(res_his_unique, 'Data/Derived/Chapter 1/all_cohort_addresses.csv', row.names=FALSE)
 
 ## explore the distribution of census tracts
 table(substr(res_his_unique$full_fips_tract_final, 1, 2))
@@ -70,7 +70,7 @@ length(unique(res_his_unique$pat_id[which(!substr(res_his_unique$full_fips_tract
 table(substr(res_his_unique$full_fips_tract_final, 1, 5))
 # filter to only those with a nyc county fips
 length(unique(res_his_unique$pat_id[which(substr(res_his_unique$full_fips_tract_final, 1, 5) %in% nyc_counties$`State County fips`)]))
-# 81905 patients
+# 74120 patients
 
 ################################################################################
 # Look for baseline address #####################################################
@@ -111,13 +111,27 @@ res_his_baseline <- res_his_baseline %>%
                                    TRUE~baseline_addr)) %>%
   ungroup()
 
+summary(as.numeric(res_his_baseline$addr_time_margin[which(res_his_baseline$baseline_addr)]))
+
 length(unique(res_his_baseline$pat_id[which(res_his_baseline$baseline_addr)])) ## 70 patients
 
 ################# FILTER TO BASELINE ADDRESS
 
 # filter to baseline address for each patient
-res_his_baseline_unique <- res_his_baseline %>% filter(baseline_addr)
+res_his_baseline_unique <- res_his_baseline %>% 
+  filter(baseline_addr)
+
+no_baseline_addr <- res_his %>% filter(!pat_id %in% res_his_baseline_unique$pat_id) %>% distinct(pat_id)
 # check that all patients have only one baseline census tract
+res_his_baseline_unique %>% group_by(pat_id) %>% filter(n()>1) %>% nrow()
+res_his %>% 
+  filter(pat_id %in% res_his_baseline_unique$pat_id[which(duplicated(res_his_baseline_unique$pat_id))]) %>% 
+  View()
+## duplicates to remove are duplicates who have no end date
+res_his_baseline_unique <- res_his_baseline_unique %>% 
+  group_by(pat_id) %>% 
+  filter(n()==1 | (length_residence!=0)) %>%
+  ungroup()
 res_his_baseline_unique %>% group_by(pat_id) %>% filter(n()>1) %>% nrow()
 
 ################# FILTER TO NYC METRO AREA ADDRESSES
@@ -140,6 +154,8 @@ res_his_baseline_unique %>%
   geom_histogram(bins=20)
 # they are generally young on average (under 25 years), confirming Linda's suspicion
 # filter them out and move on
+non_nyc_ids <- res_his_baseline_unique %>% 
+  filter(!substr(res_his_baseline_unique$full_fips_tract_final, 1, 5) %in% nyc_counties$`State County fips`)
 res_his_baseline_unique <- res_his_baseline_unique %>% 
   filter(substr(res_his_baseline_unique$full_fips_tract_final, 1, 5) %in% nyc_counties$`State County fips`)
 
@@ -167,10 +183,33 @@ res_his_baseline %>%
   filter(better_accuracy_baseline) %>%
   nrow()
 ## this recoups 173 patients out of 1813 -- doesn't seem worth it
+## explore those with low accuracy
+low_accuracy_ids <- res_his_baseline_unique %>% 
+  filter(max_accuracy_score < 0.6) %>% 
+  left_join(res_his %>% select(pat_id, census_tract_final, accuracy_type, source), by=c('pat_id', 'census_tract_final')) %>%
+  distinct()
+table(low_accuracy_ids$source) # predominantly US Census
+table(low_accuracy_ids$accuracy_type) # predominantly place (zipcode or city centroid)
+table(low_accuracy_ids$max_accuracy_score) # predominantly 0.5
+table(low_accuracy_ids$full_fips_tract_final) 
+## subset to those with high accuracy
 res_his_baseline_unique <- res_his_baseline_unique %>% filter(max_accuracy_score >= 0.6)
 
+## make final patient file with address indicated
+pat_cohort_w_address <- pat_cohort %>% 
+  select(pat_id) %>%
+  left_join(res_his_baseline_unique %>% 
+              select(pat_id, census_tract_final, full_fips_tract_final, max_accuracy_score),
+            by='pat_id') %>%
+  mutate(addr_NA_reason = case_when(!is.na(census_tract_final)~NA,
+                                    !pat_id %in% res_his$pat_id~'No address data', 
+                                    pat_id %in% no_baseline_addr$pat_id~'No baseline address',
+                                    pat_id %in% non_nyc_ids$pat_id~'Outside of NY-Newark CSA',
+                                    pat_id %in% low_accuracy_ids$pat_id~'Low accuracy score'))
+
 # write out the file
-write.csv(res_his_baseline_unique, 'Data/Derived/baseline_cohort_addresses.csv', row.names=FALSE)
+write.csv(res_his_baseline_unique, 'Data/Derived/Chapter 1/baseline_cohort_addresses.csv', row.names=FALSE)
+write.csv(pat_cohort_w_address, 'Data/Derived/Chapter 1/pat_cohort_w_address,csv', row.names=FALSE)
 
 #########################################################################################
 ### Group length of residence by relativity to baseline address #########################
@@ -198,7 +237,7 @@ res_his_weights %>%
   summarise(count=n(), .groups='drop')
 
 # write out the file
-write.csv(res_his_weights, 'Data/Derived/cohort_addresses_weights.csv', row.names=FALSE)
+write.csv(res_his_weights, 'Data/Derived/Chapter 1/cohort_addresses_weights.csv', row.names=FALSE)
 
 ### ARCHIVE CODE ########################################################################
 
