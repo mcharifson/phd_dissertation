@@ -46,7 +46,7 @@ pat_id
     when regexp_like(lower(loc_name), 'telemed|telehealth') or regexp_like(lower(dep_external_name), 'telemed|telehealth') then 'TELEMEDICINE'
   end as new_loc_name
 FROM sr3452058_table2_enc_ip_op
-WHERE enc_date >= '2016-08-01' and enc_date <= '2017-12-31' and enc_type = 'Ambulatory'
+WHERE enc_date >= '2016-08-01' and enc_date <= '2017-12-31'
 ),
 site_counts as (
 SELECT 

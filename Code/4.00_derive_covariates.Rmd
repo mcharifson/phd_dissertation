@@ -36,6 +36,7 @@ occupn <- read.csv('Data/Epic/table6_occupn_baseline.csv')
 insur_baseline <- read.csv('Data/Epic/table6_insurance_baseline.csv')
 hc_use_dx <- read.csv('Data/Epic/table3_dx_HCuse.csv')
 hc_use_social <- read.csv('Data/Epic/table6_social_HCuse.csv')
+prior_delivery_baseline <- read.csv('Data/Epic/table3_dx_prior_delivery.csv')
 ```
 
 ```{r functions}
@@ -67,11 +68,13 @@ The purpose of this document is to:
 
 (1) derive covariates that are not pre-specified in the data which includes:
 
+- Hospital Site
 - Healthcare utilization (HCU)
 - Socioeconomic variables (educational attainment & employment)
 - Insurance status
 - ART use
 - Hormonal Contraceptive Use
+
 
 Additional covariates already derived but that need to be cleaned are: 
 
@@ -105,7 +108,14 @@ insur_baseline <- subset_clean(insur_baseline)
 marital <- subset_clean(marital) 
 edu <- subset_clean(edu) 
 empy_status <- subset_clean(empy_status) 
+prior_delivery_baseline <- subset_clean(prior_delivery_baseline) 
 ```
+
+### Primary Encounter Location
+
+Hospital site was defined at baseline and during follow-up. The hospital site chosen was the most common hospital site for relevant care encounters in the first two years of follow-up (before 2019-12-31) and following the first two years of follow-up until the end of follow-up. 
+
+If a hospital site was available as the most common site, this was selected. However, if the patient ONLY attended relevant care encounters at outpatient clinics. Their site was specified as "OTHER". We also allow a patient's most common 'site' to be telemedicine, as this is informative to where and how they receive their care.
 
 ### Healthcare utilization
 
@@ -307,6 +317,8 @@ employment_final %>%
 
 In 2017, the percent of US Americans on some kind of public health insurance was 34-37% (based on US Census data[https://www.census.gov/content/dam/Census/library/publications/2022/demo/p60-278.pdf]) This includes medicare, medicaid, VA, CHAMPVA plans and NYS specific plans (child & family health plus, managed care plans, essential plans).
 
+There are some index encounters with missing insurance information. They are predominantly from FHC encounters. It is unclear if this is because the patient had no insurnace or it was not entered for another reason. 
+
 ```{r clean_insur}
 insur_baseline_unique <- insur_baseline %>%
   mutate(pat_enc_csn_id = as.character(pat_enc_csn_id),
@@ -375,10 +387,6 @@ check_unique(insur_clean)
 ```{r insur_unique_final}
 insur_clean_unique <- insur_clean %>%
   distinct(pat_id, enc_date, insur_status)
-
-# remove one patient with both public and private --> private
-insur_clean_unique <- insur_clean_unique[-which(insur_clean_unique$pat_id == 'Z5120947' &
-                                                  insur_clean_unique$insur_status == 'public'),]
 
 check_unique(insur_clean_unique)
 ```
@@ -647,25 +655,38 @@ hc_baseline_clean %>%
 
 ### Parity
 
+Parity is derived from the obstetric history questionnaire (voluntary completed for a patient) or via any indication of prior delivery in diagnosis codes prior to 2017-12-31. 
+
+If they have parity > 0 or indiciation of a prior delivery before end of baseline, they are considered parous. If they have a parity = 0, they are considered nulliparous.
+
+We could also assume no indication of prior delivery means nulliparous, but given most patients who do have parity > 1 do not also have a prior indication of delivery, I think this would be a false assumption. 
+
 ```{r clean_parity}
 parity_clean <- ob_baseline %>% 
-  mutate(parity_final = coalesce(ob_parity, ob_live_births),
-         parity_final = ifelse(ob_full_term == 0 & is.na(parity_final), 0, parity_final)) %>%
-  select(-contains('ob'))
+  mutate(parity_final = coalesce(ob_parity, ob_live_births, ob_full_term)) %>%
+  select(-contains('ob')) %>%
+  full_join(prior_delivery_baseline %>% mutate(prior_delivery = as.logical(prior_delivery)), by='pat_id') %>%
+  mutate(parity_binary = case_when(parity_final == 0~'nulliparous',
+                                 parity_final >= 1~'parous',
+                                 prior_delivery~'parous'))
 ```
 
 ```{r check_unique_parity}
 check_unique(parity_clean)
 ```
 
-Patients with indications of parity information in this cohort: `r print_percent(dim(parity_clean)[1]/dim(pat_cohort)[1])`% of patients.
+Patients with indications of parity information in this cohort: `r print_percent(length(which(!is.na(parity_clean$parity_binary)))/dim(pat_cohort)[1])`% of patients.
 
 ```{r missing_parity_ages}
 pat_cohort %>%
   mutate(parity_flag = ifelse(pat_id %in%
-                                parity_clean$pat_id[which(!is.na(parity_clean$parity_final))], 
+                                parity_clean$pat_id[which(!is.na(parity_clean$parity_binary))], 
                               TRUE, FALSE)) %>%
-  CreateTableOne(vars='age_20160801', strata='parity_flag', data=.)
+  ggplot(aes(x=age_20160801), data=.) +
+  geom_histogram(fill='purple', color='black') +
+  xlab('Age at baseline (yrs)') +
+  facet_grid(~parity_flag) + 
+  theme_bw()
 ```
 
 There isn't a notable age pattern for patients missing parity. Those who are missing parity are on average about a year older but the overall mean and spread are very similar. 
@@ -800,7 +821,7 @@ There are `r length(unique(bmi_unique$pat_id))` patients with a clean BMI at bas
 
 ```{r combine_covars}
 pat_cohort_covars <- pat_cohort %>%
-  select(pat_id, age_20160801, hcu_baseline, hcu_fu) %>%
+  select(pat_id, age_20160801, hcu_baseline, hcu_fu, site_baseline) %>%
   left_join(employment_final %>% rename(employ_margin = margin, employ_source = source)
             , by='pat_id') %>%
   left_join(insur_clean_unique %>% select(-enc_date), by='pat_id') %>%
@@ -824,15 +845,13 @@ check_unique(pat_cohort_covars)
 cont_labs <- list(age_20160801 = 'Age (years)', 
                   hcu_baseline = 'Healthcare Utilization (baseline)', 
                   hcu_fu = 'Healthcare Utilization (follow-up)', 
-                  parity_final = 'Parity', 
                   bmi_baseline = 'BMI (kg/m^2)')
-summary(tableby(~age_20160801 + hcu_baseline + hcu_fu + parity_final + bmi_baseline, data=pat_cohort_covars),
+summary(tableby(~age_20160801 + hcu_baseline + hcu_fu + bmi_baseline, data=pat_cohort_covars),
         labelTranslations = cont_labs)
 ```
 
 ```{r cont_distributions, warning=FALSE}
-cont_df <- pat_cohort_covars[,c('age_20160801','hcu_baseline', 'hcu_fu',
-                                'parity_final','bmi_baseline')]
+cont_df <- pat_cohort_covars[,c('age_20160801','hcu_baseline', 'hcu_fu','bmi_baseline')]
 list <-lapply(1:ncol(cont_df),
               function(col) ggplot2::qplot(cont_df[[col]],
                                            geom = "histogram",
@@ -849,9 +868,11 @@ ses_labs <- list(employ_simple_final = 'Employment status',
                  race_ethnic_final = 'Race/Ethnicity', 
                  language_eng_sp = 'Preferred Language',
                  marital_status_final = 'Marital status',
-                 nativity = 'Nativity')
+                 parity_binary = 'Parity',
+                 nativity = 'Nativity',
+                 site_baseline = 'Hospital Site')
 summary(tableby(~employ_simple_final + insur_status + race_ethnic_final + language_eng_sp + 
-                  marital_status_final + nativity, data=pat_cohort_covars, 
+                  marital_status_final + parity_binary + nativity + site_baseline, data=pat_cohort_covars, 
                 na.action = na.tableby(FALSE)), labelTranslations = ses_labs)
 ```
 
@@ -878,6 +899,17 @@ summary(tableby(~ART_use_baseline + ART_use_fu + HC_status, data=pat_cohort_cova
         labelTranslations = other_labs)
 ```
 
+### Site by other characteristics
+
+```{r site_descriptives, results='asis'}
+summary(tableby(site_baseline~employ_simple_final + insur_status + race_ethnic_final + language_eng_sp + 
+                  marital_status_final + parity_binary + nativity, data=pat_cohort_covars, 
+                na.action = na.tableby(FALSE)), labelTranslations = ses_labs)
+```
+
+
+Patients who only attend outpatient clinics in their baseline year appear to most closely resemble Tisch patients. They are predominantly privately insured, employed, non-Hispanic White (highest proportion of all sites), English speakers, and native (although among the highest missingness for all SES variables).
+
 ### {.unnumbered}
 
 ## 3: Explore Missingness of covariates {.tabset}
@@ -886,8 +918,9 @@ summary(tableby(~ART_use_baseline + ART_use_fu + HC_status, data=pat_cohort_cova
 
 ```{r missingness_percent}
 gg_miss_var(pat_cohort_covars %>% 
-              select(-c(pat_id, race_groups, employ_source, employ_margin, employ_clean,
-                                         contains('date'), HC_type)), 
+              select(-c(pat_id, race_groups, employ_source, employ_margin, 
+                        employ_clean, parity_final, prior_delivery, race_final, ethnicity_final,
+                        contains('date'), HC_type)), 
             show_pct = TRUE)
 ```
 
@@ -897,10 +930,17 @@ Because nativity missingess is so high, we will not use it for future missingnes
 
 ```{r missingness_pattern}
 gg_miss_upset(pat_cohort_covars %>% 
-                select(-c(pat_id, race_groups, employ_source, employ_margin, 
+                select(-c(pat_id, race_groups, employ_source, employ_margin, parity_final, prior_delivery,
                           employ_clean, race_final, ethnicity_final, nativity, 
                           contains('date'), HC_type)))
 ```
+
+```{r insurance_language_missing, results='asis'}
+summary(tableby(language_eng_sp~insur_status, data=pat_cohort_covars, 
+                na.action = na.tableby(FALSE)), labelTranslations = ses_labs)
+```
+
+Spanish speakers have a higher proportion of missing insurance (48%) vs. English (3%) vs. Other (12%). Therefore, having missing insurance does appear to be associated with being a Spanish speaker. 
 
 ### Complete case descriptives
 
@@ -911,12 +951,13 @@ pat_cohort_covars$complete <- complete.cases(pat_cohort_covars[,c("insur_status"
                                                                   "marital_status_final",
                                                                   "bmi_baseline", 
                                                                   "hcu_baseline", 
+                                                                  "site_baseline",
                                                                   "employ_simple_final",
-                                                                  "parity_final")])
+                                                                  "parity_binary")])
 
-summary(tableby(complete ~ age_20160801 + bmi_baseline + parity_final + insur_status +
+summary(tableby(complete ~ site_baseline + age_20160801 + bmi_baseline + parity_binary + insur_status +
                   race_ethnic_final + language_eng_sp + marital_status_final + employ_simple_final +
-                  ART_use_baseline + HC_status, 
+                  ART_use_baseline + HC_status + hcu_baseline, 
                 data=pat_cohort_covars, na.action = na.tableby(FALSE)),
         labelTranslations = c(cont_labs, ses_labs, other_labs))
 ```
