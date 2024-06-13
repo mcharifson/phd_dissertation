@@ -1,0 +1,395 @@
+---
+title: "Step 3.1: Mapping Neighborhood Characteristics of Cohort"
+author: "Mia Charifson"
+date: "2023-10-29"
+output: 
+  html_document:
+  df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE, message=FALSE)
+knitr::opts_knit$set(root.dir = '/Users/miacharifson/Library/CloudStorage/OneDrive-NYULangoneHealth/Charifson Dissertation/')
+
+library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+library(sf)
+library(tidycensus)
+library(readxl)
+library(ggpubr)
+library(corrplot)
+library(kableExtra)
+library(rgdal)
+library(broom)
+library(sf)
+```
+
+## Introduction
+
+This document presents various figures and maps related to the neighborhood characteristics used in chapter one of my dissertation. The two neighborhood characteristics of interest are:
+
+(1) Index of concentration of the extremes, race & income (ICE-RI)
+(2) Gentrification index
+
+```{r load}
+pat_cohort <- read.csv('Data/Derived/pat_cohort_w_censoring.csv')
+res_his <- read.csv('Data/Derived/baseline_cohort_addresses.csv', 
+                    colClasses = c(census_tract_final = "character",
+                                   full_fips_tract_final = "character"))
+res_his_weights <- read.csv('Data/Derived/cohort_addresses_weights.csv')
+nyc_counties <- read_excel('Data/External/NY_NJ_PA_CT_county_fips.xlsx', 1)
+gent_index <- read_excel('Data/External/gentrification_index/NYC_Gentrification_2000_16.xlsx', 1)
+load("Data/External/ACS_ICE_RI_2016_2022_w_geography.RData")
+```
+
+```{r neighborhood_geo}
+# Download the shapefile. (note that I store it in a folder called DATA. You have to change that if needed.)
+#download.file("https://s-media.nyc.gov/agencies/dcp/assets/files/zip/data-tools/bytes/nynta2020_23d.zip" , #destfile="Data/External/ny_nta.zip")
+# You now have it in your current working directory, have a look!
+
+# Unzip this file. You can do it with R (as below), or clicking on the object you downloaded.
+#system("unzip Data/External/ny_nta.zip")
+#  -- > You now have 4 files. One of these files is a .shp file! (TM_WORLD_BORDERS_SIMPL-0.3.shp)
+
+# Read this shape file with the rgdal library. 
+
+my_spdf <- readOGR( 
+  dsn= "Data/External/nynta2020_23d", 
+  layer="nynta2020",
+  verbose=FALSE
+)
+# 'fortify' the data to get a dataframe format required by ggplot2
+#spdf_fortified <- tidy(my_spdf, NTAName = "NAME")
+# Plot it
+#ggplot() +
+#  geom_polygon(data = spdf_fortified, aes(x = long, y = lat, group = group), fill="#69b3a2", color="white") +
+#  theme_void() 
+my_sf <- st_as_sf(my_spdf)
+```
+
+```{r cleans}
+# subset the gentrification index file
+gent_index_sub <- gent_index %>% select(tractid, nta_name, score_0.5) %>%
+  mutate(GEOID = as.character(tractid)) %>%
+  rename(gent_index = score_0.5, NTAName = nta_name) %>%
+  select(-tractid)
+
+# reformat the nyc geo file to only 2017
+nyc_geo2017 <- nyc_metro_geo %>% 
+  filter(year==2017 & substr(GEOID, 1, 5) %in% nyc_counties$`State County fips`) %>%
+  select(-moe, -year) %>% 
+  spread(variable, estimate, sep = NULL) %>% 
+  mutate(
+    A = white150_200+white_above200,
+    P = black_less10+black10_15+black15_20+black20_25,
+    T = total_white_hh + total_black_hh,
+    ICE_RI = (A-P)/T
+  )
+  
+# join all together
+df_tract <- nyc_geo2017 %>%
+  left_join(res_his %>%
+              filter(pat_id %in% pat_cohort$pat_id) %>% 
+              group_by(full_fips_tract_final) %>%
+              summarise(count=n(), .groups='drop') %>%
+              mutate(GEOID=as.character(full_fips_tract_final)), 
+            by='GEOID') %>% 
+  separate(NAME, into = c(NA, "name"), sep = ", ") %>%
+  left_join(gent_index_sub, by='GEOID') 
+  
+
+# join all together
+df_nta <- my_sf %>%
+  left_join(res_his %>%
+              filter(pat_id %in% pat_cohort$pat_id) %>%
+              mutate(GEOID=as.character(full_fips_tract_final)) %>% 
+              left_join(gent_index_sub, by='GEOID') %>%
+              group_by(NTAName) %>%
+              summarise(count=n(), .groups='drop'), 
+            by='NTAName') 
+  
+# participant level data
+df_cohort <- res_his %>%
+  filter(pat_id %in% pat_cohort$pat_id) %>%
+  mutate(GEOID=as.character(full_fips_tract_final)) %>%
+  left_join(nyc_geo2017, by='GEOID') %>%
+  separate(NAME, into = c(NA, "name"), sep = ", ") %>%
+  left_join(gent_index_sub, by='GEOID')
+```
+
+```{r, eval=FALSE, include=FALSE}
+# some ICE values are NA -- why?
+df_tract %>% filter(is.na(ICE_RI)) %>% arrange(count) %>% nrow()
+df_cohort %>% filter(!is.na(ICE_RI)) %>% nrow()
+# what are the accuracy scores of these patients
+res_his %>% 
+  filter(full_fips_tract_final %in% 
+           as.numeric(df_tract$GEOID[which(is.na(df_tract$ICE_RI))])) %>%
+  View()
+# most of them are true addresses
+```
+
+## Cohort Geographic Characteristics {.tabset}
+
+There are `r length(unique(nyc_geo2017$NAME))` census tracts in NY-Newark Combined Statistical Area in 2017. This includes the greater NYC metropolitan area and surrounding counties from NY, NJ, CT and PA. Of those census tracts, our cohort population has patients from `r length(unique(res_his$census_tract_final))` census tracts. The number of patients in the 5 NYC boroughs is `r length(which(grepl('Bronx|Kings|Richmond|Queens|New York', df_cohort$name)))`
+
+The map below shows the count of cohort patients per census tract.
+
+### Maps
+
+Maps constructed using this guide[https://r-charts.com/spatial/proportional-symbol-map-ggplot2/].
+
+```{r}
+labels_n <- st_centroid(df_tract %>% select(GEOID, count), of_largest_polygon = TRUE)
+# Bubble choropleth map
+ggplot() +
+  geom_sf(data = df_tract, fill = "grey85") +
+  geom_sf(data = labels_n,
+          pch = 21,
+          aes(size = count, fill=count),
+          col = 'grey60') +
+  labs(size = "Number of participants") +
+  scale_size(
+    range = c(1, 9),
+    guide = guide_legend(
+      direction = "horizontal",
+      nrow = 1,
+      label.position = "bottom")) +
+  scale_fill_gradientn(colours = hcl.colors(5, "RdBu", rev = TRUE, alpha = 0.9)) +
+  guides(fill = guide_legend(title = "")) +
+  labs(title = "Number of participants by Census Tract (2017)",
+       size = "") +
+  theme_void() +
+  theme(legend.position = "bottom")
+```
+```{r}
+labels_n <- st_centroid(df_nta %>% select(NTAName, count), of_largest_polygon = TRUE)
+# Bubble choropleth map
+ggplot() +
+  geom_sf(data = df_nta, fill = "grey85") +
+  geom_sf(data = labels_n,
+          pch = 21,
+          aes(size = count, fill=count),
+          col = 'grey60') +
+  labs(size = "Number of participants") +
+  scale_size(
+    range = c(1, 9),
+    guide = guide_legend(
+      direction = "horizontal",
+      nrow = 1,
+      label.position = "bottom")) +
+  scale_fill_gradientn(colours = hcl.colors(5, "RdBu", rev = TRUE, alpha = 0.9)) +
+  guides(fill = guide_legend(title = "")) +
+  labs(title = "Number of participants by Neighborhood (2017)",
+       size = "") +
+  theme_void() +
+  theme(legend.position = "bottom")
+```
+
+
+```{r cohort_weights, out.width='100%'}
+p1 <- df_tract %>%
+  ggplot() +
+  geom_sf(aes(fill = count)) +
+  coord_sf(crs = st_crs(df_tract), datum = NA) + 
+  scale_fill_viridis_c(na.value="white") +
+  labs(subtitle =  "NYC-Newark CSA") +
+  theme_void()
+
+p2 <- df_tract %>%
+  filter(grepl('Bronx|Kings|Richmond|Queens|New York', name)) %>%
+  ggplot() + 
+  geom_sf(aes(fill = count)) +
+  coord_sf(crs = st_crs(df_tract), datum = NA) + 
+  scale_fill_viridis_c(na.value="white") +
+  labs(subtitle = "NYC Boroughs") +
+  theme_void()
+
+ggarrange(p1, p2, nrow=1, common.legend = TRUE, legend = 'bottom')
+```
+
+### Top Census Tracts
+
+```{r common_tracts, rows.print=10}
+df_tract %>% 
+  sf::st_drop_geometry(.) %>%
+  left_join(gent_index %>% select(tractid, nta_name) %>% 
+              mutate(GEOID = as.character(tractid)), 
+            by='GEOID') %>%
+  select(name, nta_name, count) %>% 
+  arrange(desc(count)) %>%
+  filter(count > 300) %>%
+  knitr::kable(caption = 'Top Census Tracts by Patient Count') %>%
+  kable_styling(full_width = FALSE)
+```
+
+
+As expected, there appears to be a strong balance between lower manhattan and sunset park patients which makes perfect sense given the two main locations of NYU being Murray Hill-Manhattan and Sunset Park Brooklyn.
+
+###  {.unnumbered}
+
+## Mapping ICE-RI {.tabset}
+
+### NYC-Newark CSA
+
+```{r ice_maps, out.width='100%'}
+p1 <- df_tract %>%
+  ggplot() +
+  geom_sf(aes(fill = ICE_RI)) +
+  coord_sf(crs = st_crs(df_tract), datum = NA) + 
+  scale_fill_viridis_b(na.value="white") +
+  labs(subtitle =  "Entire population") +
+  theme_void()
+
+p2 <- df_tract %>%
+  filter(count > 0) %>%
+  ggplot() +
+  geom_sf(aes(fill = ICE_RI)) +
+  coord_sf(crs = st_crs(df_tract), datum = NA) + 
+  scale_fill_viridis_b(na.value="white") +
+  labs(subtitle =  "Study Cohort") +
+  theme_void()
+  
+
+ggarrange(p1, p2, nrow=1, common.legend = TRUE, legend = 'bottom')
+```
+
+### Zoom-in on NYC Boroughs
+
+```{r ice_maps_nyc, out.width='100%'}
+p1 <- df_tract %>%
+  filter(grepl('Bronx|Kings|Richmond|Queens|New York', name)) %>%
+  ggplot() + 
+  geom_sf(aes(fill = ICE_RI)) +
+  coord_sf(crs = st_crs(df_tract), datum = NA) + 
+  scale_fill_viridis_b(na.value="white") +
+  labs(subtitle = "Entire Population") +
+  theme_void()
+
+p2 <- df_tract %>%
+  filter(count > 0) %>%
+  filter(grepl('Bronx|Kings|Richmond|Queens|New York', name)) %>%
+  ggplot() + 
+  geom_sf(aes(fill = ICE_RI)) +
+  coord_sf(crs = st_crs(df_tract), datum = NA) + 
+  scale_fill_viridis_b(na.value="white") +
+  labs(subtitle = "Study Population") +
+  theme_void()
+
+ggarrange(p1, p2, nrow=1, common.legend = TRUE, legend = 'bottom')
+```
+
+### Histograms
+
+```{r ice_hists, out.width='100%'}
+p1 <- df_tract %>%
+  filter(!is.na(ICE_RI)) %>%
+  ggplot(data=., aes(x=ICE_RI)) +
+  geom_histogram(bins=50, fill='lightblue', color='black') +
+  ggtitle('Entire Population') +
+  theme_bw()
+p2 <- df_cohort %>%
+  filter(!is.na(ICE_RI)) %>%
+  ggplot(data=., aes(x=ICE_RI)) +
+  geom_histogram(bins=50, fill='lightgreen', color='black') +
+  ggtitle('Study Cohort') +
+  theme_bw()
+ggarrange(p1, p2, nrow=2, common.legend = TRUE, legend = 'bottom',
+          caption= 'ICE-RI distribution')
+```
+
+###  {.unnumbered}
+
+## Mapping Gentrification Index {.tabset}
+
+Note: the gentrification index is only for NYC boroughs so it cannot be mapped for the entire cohort
+
+### NYC Boroughs
+
+```{r gentrification_maps_nyc, out.width='100%'}
+p1 <- df_tract %>%
+  filter(grepl('Bronx|Kings|Richmond|Queens|New York', name)) %>%
+  ggplot() +
+  geom_sf(aes(fill = gent_index)) +
+  coord_sf(crs = st_crs(df_tract), datum = NA) + 
+  scale_fill_viridis_b(na.value="white") +
+  labs(title = "New York City Greater Metropolitan Area",
+       subtitle =  "Gentrification index distribution") +
+  theme_void()
+
+p2 <- df_tract %>%
+  filter(count > 0) %>%
+  filter(grepl('Bronx|Kings|Richmond|Queens|New York', name)) %>%
+  ggplot() + 
+  geom_sf(aes(fill = gent_index)) +
+  coord_sf(crs = st_crs(df_tract), datum = NA) + 
+  scale_fill_viridis_b(na.value="white") +
+  labs(title = "Cohort Study Population",
+       subtitle = "Gentrification index distribution") +
+  theme_void()
+
+ggarrange(p1, p2, nrow=1, common.legend = TRUE, legend = 'bottom')
+```
+
+### Gentrification Distributions
+
+```{r gentrification_boxplots, out.width='100%'}
+p1 <- df_tract %>%
+  filter(!is.na(gent_index)) %>%
+  ggplot(data=., aes(x=gent_index)) +
+  geom_histogram(bins=50, fill='lavender', color='black') +
+  ggtitle('In Greater NYC Metro Area') +
+  theme_bw()
+p2 <- df_cohort %>%
+  filter(!is.na(gent_index)) %>%
+  ggplot(data=., aes(x=gent_index)) +
+  geom_histogram(bins=50, fill='lightyellow', color='black') +
+  ggtitle('In Cohort Study Population') +
+  theme_bw()
+ggarrange(p1, p2, nrow=2, common.legend = TRUE, legend = 'bottom',
+          caption= 'Gentrification index distribution')
+```
+
+###  {.unnumbered}
+
+## Relocation leading to changes in ICE throughout follow-up
+
+Since patients have residential history information that extends prior to and after baseline, we can assess how well the baseline ICE-RI represents overall ICE-RI exposure (based on available data), ICE-RI prior to baseline, and ICE-RI during follow-up. In an ideal world, these would all be strongly correlated as their address and ICE-RI exposure at baseline would ideally represent a cumulative and static exposure based on our study design.
+
+Below we calculate the weighted overall ICE-RI exposure, where weights represent the months spent at each respective census tract out of all the available residential history data we have on a given patient. Then we calculate the weighted ICE-RI exposure for prior to baseline and during follow-up, where weights represent the months spent at each census tract within each respective period.
+
+```{r}
+overall_weighted_res_his <- res_his_weights %>%
+  mutate(full_fips_tract_final = as.character(full_fips_tract_final)) %>%
+  # give a minimum of 1 month for each census tract
+  mutate(length_residence_months = ifelse(length_residence_months==0, 1,
+                                          length_residence_months)) %>%
+  left_join(df_tract %>% select(full_fips_tract_final, ICE_RI), by='full_fips_tract_final') %>%
+  filter(!is.na(ICE_RI)) %>%
+  group_by(pat_id) %>%
+  summarise(overall = weighted.mean(ICE_RI, length_residence_months),
+            .groups='drop')
+
+df_cohort_res_his <- res_his_weights %>%
+  # give a minimum of 1 month for each census tract
+  mutate(length_residence_months = ifelse(length_residence_months==0, 1,
+                                          length_residence_months)) %>%
+  left_join(df_tract %>% select(full_fips_tract_final, ICE_RI), by='full_fips_tract_final') %>%
+  filter(!is.na(ICE_RI)) %>%
+  group_by(pat_id, res_his_type) %>%
+  summarise(avg_ICE_RI = weighted.mean(ICE_RI, length_residence_months),
+            .groups='drop') %>%
+  pivot_wider(names_from = res_his_type, values_from=avg_ICE_RI) %>%
+  left_join(overall_weighted_res_his, by = 'pat_id')
+```
+
+Out of the `r dim(df_cohort_res_his)[1]` patients with an ICE-RI value at baseline, `r length(which(!is.na(df_cohort_res_his$"before baseline")))`) patients have residential address histories prior to baseline and `r length(which(!is.na(df_cohort_res_his$"during follow-up")))` patients have residential address history changes during follow-up.
+
+The below we map between ICE-RI at baseline compared to the other weighted mean ICE-RI exposure periods.
+
+```{r ice_boxplot_over_FU, out.width='100%'}
+corrplot.mixed(cor(df_cohort_res_his[-1], use='pairwise'), upper='ellipse', tl.cex=0.75)
+```
+
+As visible, the values are generally strongly correlated, but there might be outliers who experience large changes in ICE-RI exposure before baseline -\> baseline and from baseline -\> during follow-up.

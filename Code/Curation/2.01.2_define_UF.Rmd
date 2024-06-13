@@ -1,0 +1,743 @@
+---
+title: "Step 2.01: Defining Incident UF from NYULH EHR"
+author: "Mia Charifson"
+date: "2024-03-15"
+output: 
+  html_document:
+    code_folding: hide
+---
+
+The purpose of this document is to summarize the methodology used to derive incident UF diagnosis from the NYU restrospective EHR cohort. 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+knitr::opts_knit$set(root.dir = '/Users/miacharifson/Library/CloudStorage/OneDrive-NYULangoneHealth/Charifson Dissertation/')
+
+library(tidyverse)
+library(ggplot2)
+library(lubridate)
+library(tableone)
+library(arsenal)
+library(readxl)
+library(ggpubr)
+library(corrplot)
+library(data.table)
+```
+
+Last updated on `r lubridate::today()`.
+
+# 2.0. Data input & set-up
+
+Load in all tables
+```{r load}
+pat_cohort <- read.csv('Data/Derived/pat_cohort_w_censoring.csv') 
+uf_endo <- read.csv('Data/Epic/table3_dx_outcomes.csv')
+uf_endo_filled_dates <-read.csv('Data/Epic/fill_missing_dx_dates.csv')
+imaging_dx <- read.csv('Data/Epic/table3_dx_imaging.csv') 
+imaging_orders <- read.csv('Data/Epic/table4_proc_imaging.csv') 
+surgery_orders <- read.csv('Data/Epic/table4_proc_surgery.csv') 
+surgery_records <- read.csv('Data/Epic/table4_surgery.csv')
+```
+
+Subset tables to the eligible cohort
+```{r subset_inputs}
+# Combine tables that need combining
+uf_endo_cohort <- uf_endo %>%
+  mutate(dx_date = strptime(dx_date, "%Y-%m-%d %H:%M:%S")) %>%
+  ## remove those missing a dx date
+  filter(!is.na(dx_date)) %>%
+  ## add in filled dx_date where missing
+  bind_rows(uf_endo_filled_dates %>% 
+              filter(!is.na(dx_date)) %>%
+              mutate(dx_date_filled = strptime(dx_date_filled, "%Y-%m-%d %H:%M:%S"),
+                     dx_date = strptime(dx_date, "%Y-%m-%d %H:%M:%S")) %>%
+              mutate(dx_date = case_when(is.na(dx_date)~dx_date_filled, TRUE~dx_date),
+                     pat_enc_csn_id = as.character(pat_enc_csn_id))) %>%
+  # fill in missing index_enc_date
+  inner_join(pat_cohort %>% select(pat_id, index_enc_date), by = 'pat_id')
+  
+## combine all imaging
+imaging_all <- imaging_dx %>%
+  mutate(imaging_date = strptime(dx_date, "%Y-%m-%d %H:%M:%S")) %>%
+  #mutate(pat_enc_csn_id = as.numeric(pat_enc_csn_id)) %>%
+  mutate(event_name = dx_name,
+         event_type = paste0('Imaging-', dx_type)) %>%
+  select(pat_id, imaging_date, event_name, event_type) %>%
+  bind_rows(imaging_orders %>% 
+              mutate(imaging_date = as.Date(ordering_date)) %>%
+              mutate(event_name = procedure_name,
+                     event_type = 'Imaging Order') %>%
+              select(pat_id, imaging_date, event_name, event_type)) %>%
+  filter(pat_id %in% pat_cohort$pat_id)
+
+## combine all surgery
+surgery_all <- surgery_records %>%
+  mutate(surgery_date = strptime(surgery_date, "%Y-%m-%d %H:%M:%S")) %>%
+  full_join(surgery_orders %>% mutate(surgery_date = as.Date(ordering_date)), 
+            by=c('pat_id', 'pat_enc_csn_id', 'surgery_date', 'procedure_name',
+                                 'procedure_code_type', 'procedure_code')) %>%
+  mutate(type = ifelse(!is.na(performed), 'Surgery record', 'Surgery order')) %>%
+  select(-ordering_date) %>%
+  filter(pat_id %in% pat_cohort$pat_id)
+```
+
+Verify there are no cases with a Dx prior to index encounter
+```{r check_no_prior_dx, eval=FALSE}
+# there should be no UF/Endo diagnoses prior to their index enc
+length(which(uf_endo_cohort$dx_date[uf_endo_cohort$icd10 != 'N80.03'] < uf_endo_cohort$index_enc_date[uf_endo_cohort$icd10 != 'N80.03']))
+
+# look at these patients
+#uf_endo_cohort %>% filter(icd10 != 'N80.03' & dx_date <= index_enc_date) %>% View()
+```
+
+Collapse to unique dates for each input type (dx, imaging, surgery)
+```{r subset_unique_dates}
+uf_other_codes <- c('D21.9', 'O34.10', 'O34.11', 'O34.12', 'O34.13', 'IMO0001', 'N93.9', 'D28.1', 'O46.8X1')
+uf_names <- 'fibroid|leiomyoma|uterine myoma|uterine fibromyoma'
+
+uf_dx_unique <- uf_endo_cohort %>% 
+  filter(!is.na(dx_date)) %>%
+  filter(dx_date <= '2023-08-01') %>% # filter to end of FU
+  filter(grepl('D25', icd10) | (icd10 %in% uf_other_codes & grepl(uf_names, tolower(dx_name)))) %>%
+  rename(date=dx_date) %>%
+  select(-referral_id, -icd10, -dx_date_filled, -pat_enc_csn_id) %>%
+  group_by(pat_id, date) %>%
+  summarise(event_name = paste0(unique(dx_name), collapse=', '),
+            event_type = paste0(unique(dx_type), collapse=', '),
+            .groups='drop')
+
+imaging_unique <- imaging_all %>% 
+  mutate(date=as.Date(imaging_date)) %>%
+  group_by(pat_id, date)  %>%
+  summarise(event_name = paste0(unique(event_name), collapse=', '),
+            event_type = paste0(unique(event_type), collapse=', '),
+            .groups='drop')
+
+surgery_unique <- surgery_all %>% 
+  mutate(date = as.Date(surgery_date)) %>%
+  group_by(pat_id, date) %>%
+  summarise(event_name = paste0(unique(procedure_name), collapse=', '),
+            event_type = paste0(unique(type), collapse=', '),
+            .groups='drop')
+```
+
+```{r check_dx_names, eval=FALSE, include=FALSE}
+## check fibroid dx_names
+uf_endo_cohort %>% 
+  filter(!is.na(dx_date)) %>%
+  filter(dx_date <= '2023-08-01') %>%
+  filter(grepl('D25', icd10) | (icd10 %in% uf_other_codes & grepl(uf_names, tolower(dx_name)))) %>%
+  distinct(dx_name) %>% 
+  View()
+```
+
+
+Bind all inputs together
+```{r final_inputs}
+uf_all_long <- bind_rows(uf_dx_unique, imaging_unique, surgery_unique) %>%
+  distinct() %>%
+  filter(date <= '2023-08-01') %>% # filter to end of FU
+  arrange(pat_id, date)
+
+uf_pat_unique <- uf_dx_unique %>% distinct(pat_id)
+```
+
+There are `r dim(uf_pat_unique)[1]` patients who have any UF Dx code added to their EHR at some point during follow-up.
+
+# 2.1. Derive variables related to UF definition {.tabset}
+
+Variable list: 
+
+- First diagnosis information: date, type, name, first Dx after partial LTFU (4)
+- Diagnosis count information: all, referral, medical_hx, all_medical_hx (4)
+- Diagnosis procedure information (for surgical and imaging): ever, confirmed w/in 6 months, confirmed w/ prevalent Dx ever (3x2)
+- Meta diagnosis information: any locations, first date of location, ever related to pregnancy (UF only) (3)
+
+*Total number of variables: 17*
+
+## First diagnosis information
+
+Extract variables
+```{r uf_first_dx}
+uf_first_dx <- uf_endo_cohort %>% 
+  filter(!is.na(dx_date)) %>%
+  filter(dx_date <= '2023-08-01') %>%
+  filter(grepl('D25', icd10) | (icd10 %in% uf_other_codes & grepl(uf_names, tolower(dx_name)))) %>%
+  group_by(pat_id) %>%
+  filter(dx_date==min(dx_date)) %>%
+  summarise(first_dx_date = mean(dx_date),
+            first_dx_type = paste0(unique(dx_type), collapse = ';'),
+            first_dx_name = paste0(unique(dx_name), collapse = ';'),
+            .groups='drop') %>%
+  left_join(pat_cohort %>% 
+              select(pat_id, index_enc_date, final_censor_date, 
+                     final_censor_type, ltfu_status, ltfu_reengage_date)
+            , by="pat_id") %>%
+  mutate(time_to_first_dx = difftime(first_dx_date, index_enc_date, units="days"),
+         dx_after_partial_LTFU = (first_dx_date == ltfu_reengage_date))
+```
+
+Plot distribution for date of first diagnosis
+```{r uf_first_dx_plot}
+uf_first_dx %>%
+  group_by(first_dx_date) %>%
+  summarise(count=n(), .groups='drop') %>%
+  mutate(cumulative_count = cumsum(count)) %>%
+  ggplot(data=., aes(x=first_dx_date, y=cumulative_count)) +
+  geom_line() +
+  ylab('Cumulative Count of Patients Diagnosed with UF') +
+  xlab('Date of Diagnosis') +
+  theme_bw()
+```
+
+Plot distribution of time to first diagnosis
+```{r time_to_first_uf_dx_plot}
+uf_first_dx %>%
+  # only for those diagnosed under 6 months
+  ggplot(data=., aes(x=time_to_first_dx)) +
+  geom_histogram(fill='lavender', color='black', binwidth=30) +
+  xlab('Days between Index Encounter and First UF Dx') +
+  theme_bw()
+```
+
+Table of first diagnosis type
+```{r uf_first_dx_table}
+uf_first_dx %>%
+  mutate(medical_hx = case_when(grepl('Medical History', first_dx_type)~TRUE, TRUE~FALSE),
+         encounter = case_when(grepl('Encounter Diagnosis', first_dx_type)~TRUE, TRUE~FALSE),
+         problem_list = case_when(grepl('Problem List', first_dx_type)~TRUE, TRUE~FALSE),
+         hospital_dx = case_when(grepl('Hospital Account Diagnosis', first_dx_type)~TRUE, TRUE~FALSE),
+         referral_dx = case_when(grepl('Referral Diagnosis', first_dx_type)~TRUE, TRUE~FALSE)) %>%
+CreateTableOne(data=., vars = c('referral_dx', 'encounter', 'medical_hx', 'problem_list', 'hospital_dx'))
+```
+These sum to more than 100% because patients can get one code type dropped on the same day as another (i.e. a referral Dx and an encounter Dx on the same day).
+
+There are `r length(which(uf_first_dx$time_to_first_dx <= 180))` patients diagnosed in their first 6 months of follow-up.
+
+## Diagnosis count variables
+
+Extract diagnosis count variables
+```{r uf_dx_count}
+uf_dx_count <- uf_dx_unique %>% 
+  mutate(referral_dx=ifelse(grepl('Referral Diagnosis', event_type), TRUE, FALSE),
+         medical_hx=ifelse(event_type == 'Medical History', TRUE, FALSE)) %>%
+  group_by(pat_id) %>%
+  summarise(dx_count = sum(grepl('Diagnosis|Problem|History', event_type)), 
+            referral_count = sum(referral_dx),
+            all_medical_hx = ifelse(n()==sum(medical_hx), TRUE, FALSE),
+            .groups='drop')
+```
+
+Plot the distribution of counts of diagnoses
+```{r uf_dx_count_plot}
+uf_dx_count %>% 
+  filter(dx_count > 0) %>%
+  ggplot(data=., aes(x=dx_count)) + 
+  geom_histogram(fill='lightblue', color='black', binwidth = 5) +
+  xlab('Number of UF Dx per patient') +
+  theme_bw()
+```
+`r length(which(uf_dx_count$dx_count == 1))` cases have only 1 UF diagnosis code in their records.
+This is `r round(length(which(uf_dx_count$dx_count == 1))/dim(uf_pat_unique)[1], 2)*100`% of UF patients. Some of these may be confirmed below via other hints.
+
+Relative frequency of first diagnosis type when they only have one diagnosis code
+```{r uf_only_one_dx_table}
+uf_all_long %>%
+  filter(pat_id %in% uf_dx_count$pat_id[which(uf_dx_count$dx_count == 1)]) %>%
+  filter(grepl('Diagnosis|History|Problem', event_type)) %>%
+  mutate(medical_hx = case_when(grepl('Medical History', event_type)~TRUE, TRUE~FALSE),
+         encounter = case_when(grepl('Encounter Diagnosis', event_type)~TRUE, TRUE~FALSE),
+         problem_list = case_when(grepl('Problem List', event_type)~TRUE, TRUE~FALSE),
+         hospital_dx = case_when(grepl('Hospital Account Diagnosis', event_type)~TRUE, TRUE~FALSE),
+         referral_dx = case_when(grepl('Referral Diagnosis', event_type)~TRUE, TRUE~FALSE)) %>%
+  CreateTableOne(data=., test=FALSE,
+                 vars = c('referral_dx', 'encounter', 'medical_hx', 'problem_list', 'hospital_dx'))
+```
+Of those with only 1 UF diagnosis code, most are encounter diagnoses and not medical history diagnoses which is promising. The 277 patients with only one diagnosis code, that is a medical history, are going to be difficult to place and may be prevalent cases. 
+
+Table showing censoring among those with only one diagnosis code
+```{r one_dx_code_censoring}
+tab <- uf_first_dx %>%
+  filter(pat_id %in% uf_dx_count$pat_id[which(uf_dx_count$dx_count == 1)]) %>%
+  filter(first_dx_date > final_censor_date & final_censor_type == 'LTFU') %>%
+  mutate(ltfu_status = factor(ltfu_status)) %>%
+  CreateTableOne(data=., vars='ltfu_status')
+
+print(tab, showAllLevels=TRUE)
+```
+Most patients with only one UF dx who are also are diagnosed after they are partially LTFU (they are likely these medical history diagnosis after re-engage patients).
+
+There are `r length(which(uf_dx_count$all_medical_hx))` patients for whom the only indication for UF in their EHR is via medical history codes (and no diagnostic procedures). There is a high likelihood these patients are prevalent cases who only had their health history added to their record after entry to cohort. 
+
+Assumption: if they were diagnosed outside NYU but during follow-up, they'd have a referral diagnosis code. 
+
+Plot age distribution among only medical history cases
+```{r medical_hx_age_plot}
+# are these patients generally older
+pat_cohort %>%
+  filter(pat_id %in% uf_dx_count$pat_id[which(uf_dx_count$all_medical_hx)]) %>%
+  ggplot(data=., aes(x=age_20160801)) +
+  geom_histogram(fill='lightyellow', color='black', binwidth=5) +
+  xlab('Age at baseline') +
+  theme_bw()
+```
+Patients who only ever get UF codes dropped as medical history (and never have any procedures) are predominantly older patients (above 35 years old). I will explore the younger patients but I think in general these patients should be considered prevalent cases and exclude from the analysis. 
+
+Look at time to first diagnosis for only medical history cases
+```{r time_plot_medical_hx_only}
+# time to first dx for all medical history cases
+uf_first_dx %>%
+  filter(pat_id %in% unique(uf_dx_count$pat_id[which(uf_dx_count$all_medical_hx)])) %>%
+  ggplot(data=., aes(x=as.numeric(time_to_first_dx))) +
+  geom_histogram(fill='lavender', color='black', binwidth=30) +
+  xlab('Days between Index Encounter and First UF Dx') +
+  geom_vline(xintercept = 365, color='orange') +
+  theme_bw()
+```
+Some of these patients are surely prevalent UF cases based on the early time to first diagnosis, but there is a wide distribution as to the timing of the first diagnoses which implies that some are incident cases that for some reason only get dropped as medical history diagnoses from the start. Assumption: these represent cases diagnosed outside of NYU and then come to NYU after treatment/diagnosis. 
+
+## Diagnostic procedure hints
+
+Extract the time between any diagnostic procedure and the closest date of a diagnosis code
+```{r procedure_dx_sequelae, warnings=FALSE}
+procedure_df <- uf_all_long
+setDT(procedure_df)
+# indexing which rows are procedures
+procedure_df$is_procedure <- grepl('Imaging|Surgery', procedure_df$event_type)
+# indexing which rows are dx (ignore imaging Dx for now)
+procedure_df$is_diagnosis <- grepl('Diagnosis|Problem|List|History', procedure_df$event_type) & !grepl('Imaging',procedure_df$event_type)
+# rearrange so if a procedure and dx happen on the same day the procedure goes first
+procedure_df <- arrange(procedure_df, pat_id, date, is_diagnosis, is_procedure)
+# get the index of the next row that is a dx when the row is a procedure
+procedure_df[,next_dx_index:=zoo::na.locf(NA^(!is_diagnosis)*.I, fromLast=T, na.rm=F)*NA^(!is_procedure), by=pat_id]
+# find time difference between the date of procedure and the next Dx date
+procedure_df <- procedure_df[,next_dx_time_interval:=difftime(date[next_dx_index], date, units="days")]
+procedure_df <- procedure_df[,next_dx_name:=event_name[next_dx_index]]
+procedure_df <- procedure_df[,next_dx_type:=event_type[next_dx_index]]
+# convert to data frame
+procedure_df <- as.data.frame(procedure_df) %>%
+  mutate(method = case_when(grepl('Surgery', event_type)~"Surgery",
+                            grepl('Imaging', event_type)~"Imaging",
+                            TRUE~NA),
+         confirmed_6months = (as.numeric(next_dx_time_interval)<180),
+         confirmed_ever_prevalent = grepl('List|History', next_dx_type))
+```
+
+`r length(which(procedure_df$next_dx_time_interval==0))` diagnosis codes are on the same date as a procedure.
+
+Plot the time margin distributions by procedure type (imaging vs. surgery)
+```{r procedure_dx_time_margin}
+procedure_df %>%
+  filter(!is.na(next_dx_time_interval)) %>%
+  group_by(pat_id) %>%
+  filter(next_dx_time_interval == min(next_dx_time_interval, na.rm=TRUE)) %>%
+  # in the case that there are multiple procedures with same margin, take the earlier one
+  filter(date == min(date, na.rm=TRUE)) %>%
+  filter(next_dx_time_interval < 180) %>%
+  ungroup() %>%
+  ggplot(data=., aes(x=next_dx_time_interval/30, fill=method)) +
+  xlab('Shortest Time between Dx procedure and next Dx code (months)') +
+  geom_histogram(binwidth = 1) +
+  facet_wrap(~method, scales = 'free_y') +
+  theme_bw()
+```
+The graph shows the count for patients who have an UF Dx, had any diagnostic procedure performed in their EHR, and had another UF Dx code following that procedure. The earliest procedure with the shortest margin between procedure and Dx code are selected per patient. The vast majority have an imaging procedure performed and within one month another Dx code is dropped. For those with a surgical procedure chosen, they are also quickly followed with another Dx code.
+
+Derive final procedure hints for each patients
+```{r procedure_hints}
+procedure_hints <- procedure_df %>%
+  group_by(pat_id) %>%
+  summarise(has_imaging = (sum(method == 'Imaging', na.rm=TRUE)>0),
+            has_surgery = (sum(method == 'Surgery', na.rm=TRUE)>0),
+            ever_confirmed_6months = (sum(confirmed_6months, na.rm=TRUE)>0),
+            prevalent_dx_after_proc = (sum(confirmed_ever_prevalent, na.rm=TRUE)>0),
+            imaging_confirmed = (sum(confirmed_6months & method == 'Imaging', na.rm=TRUE)>0),
+            surgery_confirmed = (sum(confirmed_6months & method == 'Surgery', na.rm=TRUE)>0),
+            .groups = 'drop')
+
+first_confirm_proc <- procedure_df %>%
+  filter(confirmed_6months) %>%
+  group_by(pat_id) %>%
+  filter(date==min(date) & grepl('Surgery|Imaging', event_type)) %>%
+  summarise(first_confirm_date = min(date),
+            first_confirm_name = paste0(unique(event_name), collapse = ';'),
+            first_confirm_type = case_when(n()>1~'both', TRUE~method),
+            .groups = 'drop')
+
+## add in first confirmation type
+procedure_hints <- procedure_hints %>%
+  left_join(first_confirm_proc, by=c('pat_id')) %>%
+  filter(pat_id %in% uf_pat_unique$pat_id) %>%
+  distinct()
+  
+#summary(procedure_hints)
+#table(procedure_hints$first_confirm_type)
+```
+
+Among those who are eventually confirmed, what is the distribution of time to first confirmation (between the first Dx date and the first confirmed procedure)?
+```{r time_to_confirm_fig}
+procedure_hints %>%
+  left_join(uf_first_dx %>% select(pat_id, first_dx_date), by='pat_id') %>%
+  filter(ever_confirmed_6months) %>%
+  mutate(time_to_confirmation = difftime(first_confirm_date, first_dx_date, units='days')) %>%
+  ggplot(data=., aes(x=time_to_confirmation, fill = first_confirm_type)) +
+  xlab('Time between First Dx and First Confirmed Dx code (days)') +
+  geom_histogram(binwidth = 30) +
+  facet_wrap(~first_confirm_type, scales = 'free_y') +
+  theme_bw()
+```
+
+```{r time_to_confirm_table}
+procedure_hints %>%
+  left_join(uf_first_dx %>% select(pat_id, first_dx_date), by='pat_id') %>%
+  filter(ever_confirmed_6months) %>%
+  mutate(time_to_confirmation = as.numeric(difftime(first_confirm_date, first_dx_date, units='days'))) %>%
+  CreateTableOne(vars='time_to_confirmation', strata = 'first_confirm_type', data=.)
+```
+
+## Meta-diagnosis information
+
+Location of the fibroid & first date of first location Dx
+```{r location}
+# extract location of the UF based on Dx name if that exists
+uf_loc_names <- 'intramural|subserous|submucosal|subserosal|submucous|cervix|cervical'
+location_df <- procedure_df %>%
+  filter(grepl('History|List|Diagnosis', event_type) & !grepl('Imaging', event_type)) %>%
+  mutate(location = (grepl(uf_loc_names, tolower(event_name)))) %>%
+  group_by(pat_id) %>%
+  arrange(date) %>%
+  summarise(any_location = (sum(location)>0),
+            first_location_date = first(date[which(location)])) %>%
+  filter(pat_id %in% uf_pat_unique$pat_id)
+## add to other hints
+other_hints <- uf_pat_unique %>%
+  left_join(location_df,  by='pat_id')
+```
+
+Ever related to pregnancy (UF only)
+```{r pregnancy}
+# extract location of the UF based on Dx name if that exists
+uf_pregnancy <- 'pregnancy|partum|antenatal|antepartum'
+procedure_df$pregnancy_related <- (!grepl("History", procedure_df$event_type) &
+                                        grepl(uf_pregnancy, tolower(procedure_df$event_name)))
+# join to other hints
+other_hints <- other_hints %>%
+  left_join(procedure_df %>%
+              group_by(pat_id) %>%
+              summarise(ever_pregnancy_related = (sum(pregnancy_related)>0)), 
+            by='pat_id')
+```
+
+Historical diagnosis close to fist diagnosis date
+```{r prevalent_cases}
+## grab hx codes and record first instance
+uf_hx_code <- uf_endo_cohort %>% 
+  filter(grepl('Z86', icd10)) %>%
+  group_by(pat_id) %>% 
+  summarise(first_hx_code = min(dx_date), .groups='drop') %>%
+  inner_join(uf_first_dx %>% select(pat_id, first_dx_date, first_dx_type, first_dx_name),
+             by='pat_id') %>%
+  mutate(hx_code_margin = difftime(first_hx_code, first_dx_date, unit='days'),
+         confident_prevalent = (hx_code_margin<=60))
+
+# join to other hints
+other_hints <- other_hints %>%
+  left_join(uf_hx_code %>% select(pat_id, confident_prevalent), 
+            by='pat_id')
+```
+
+## {.unnumbered}
+
+# 2.2. Heatmap of UF outcome hints
+
+There are several "hints" in the EHR which might encourage confidence that a UF Dx is a true positive. They were extracted from the EHR above. Understanding how they relate to each other in our cohort can be informative of how to identify confident incident and prevalent cases.
+
+```{r combine_hints}
+# subset to only those with a UF dx
+uf_dx_hints <- uf_first_dx %>% 
+  select(pat_id, contains('first'), dx_after_partial_LTFU) %>%
+  left_join(uf_dx_count, by='pat_id') %>%
+  left_join(procedure_hints, by='pat_id') %>%
+  left_join(other_hints, by='pat_id') %>%
+  mutate(across(is_logical, ~ifelse(is.na(.), FALSE, .)),
+         time_to_first_dx = as.numeric(time_to_first_dx),
+         multiple_referral = (referral_count >= 2),
+         multiple_dx = (dx_count >= 2),
+         first_dx_medical = grepl('Medical History', first_dx_type))
+names(uf_dx_hints)
+```
+
+```{r num_hints_df}
+# only add up hints for incident cases
+bin_hints <- c('dx_after_partial_LTFU', 'has_imaging', 'has_surgery', 'ever_confirmed_6months', 
+               'prevalent_dx_after_proc', 'imaging_confirmed', 'surgery_confirmed', 'any_location', 
+               'ever_pregnancy_related', 'multiple_referral')
+uf_dx_hints <- uf_dx_hints %>%
+  mutate(number_pos_hints = rowSums(.[bin_hints], na.rm=TRUE)) %>%
+  mutate(confident_incident = case_when(confident_prevalent~FALSE,
+                                        ever_confirmed_6months~TRUE,
+                                        any_location~TRUE,
+                                        ever_pregnancy_related~TRUE,
+                                        prevalent_dx_after_proc~TRUE,
+                                        dx_after_partial_LTFU~TRUE,
+                                        multiple_referral~TRUE,
+                                        TRUE~FALSE))
+```
+
+
+```{r uf_hints_corrplot}
+all_hints <- c(bin_hints, 'time_to_first_dx', 'dx_count', 'referral_count', 'all_medical_hx', 'first_dx_medical', 
+               'confident_incident', 'confident_prevalent', 'multiple_dx', 'number_pos_hints')
+corrplot.mixed(cor(uf_dx_hints[,c(all_hints)], 
+                   use='pairwise.complete.obs'),  # Correlation matrix
+               lower = "number", 
+               upper = "ellipse",
+               tl.cex=0.5,
+               number.cex=0.5,
+               tl.pos = "lt",
+               tl.col = "black") 
+```
+The correlation plot above visualizes the correlation between these binary UF diagnosis characteristics. The number of positive hints is a count of how many of the hints we believe to be predictive of incident case Dx appear in their EHR. I interpret strong positive associations as indicative of characteristics that are most common among cases with an abundance of EHR data pointing it to be an incident case. 
+
+NOTE: it is important to note that this is inflated for certain characteristics such as `ever_confirmed_6months`, which by definition also requires a procedure and a confirmed procedure (so at a minimum when `ever_confirmed_6months = TRUE`, `number_pos_hints = 3`). **For this reason, number of hints alone cannot be used to define confident cases, but is just used here to explore how these EHR data variables relate to each other.**
+
+Distribution of positive hints (split by whether `ever_confirmed_6months`)
+```{r num_hints_plot}
+uf_dx_hints %>%
+  ggplot(data=., aes(x=number_pos_hints)) +
+  geom_histogram(fill='darkseagreen2', color='black', binwidth=1) +
+  facet_grid(~ever_confirmed_6months) + 
+  xlab('Number of UF Dx Hints per patient') +
+  theme_bw()
+```
+```{r check_ns}
+# check for duplicates
+paste0('N duplicate patient IDs: ', length(which(duplicated(uf_dx_hints$pat_id))))
+
+# make sure all confirmations are within 180 days prior to first dx code
+paste0('N confirmation date >6 months before first dx date: ', length(which(difftime(uf_dx_hints$first_dx_date, uf_dx_hints$first_confirm_date, units='days') > 180))
+       )
+# make sure all location dates are not earlier 
+paste0('N location date before first dx date: ',
+length(which(uf_dx_hints$first_dx_date > uf_dx_hints$first_location_date)))
+
+# check how many have location on the first date of diagnosis and no procedure
+## these could be potentially prevalent diagnoses
+paste0('N location date on same day as first dx date but no confirmation: ',
+length(which(uf_dx_hints$first_dx_date == uf_dx_hints$first_location_date & 
+               (uf_dx_hints$first_confirm_date > uf_dx_hints$first_dx_date |
+                  is.na(uf_dx_hints$first_confirm_date)))))
+
+# check how many are confirmed and then first diagnosis code happens
+paste0('N confirmed before or on first dx date: ',
+       uf_dx_hints %>% 
+         filter(first_dx_date == first_confirm_date |
+                  difftime(first_dx_date, first_confirm_date, units='days') < 180) %>%
+  nrow())
+
+# check how many are confirmed and then first diagnosis code happens
+paste0('N with only one billing diagnosis: ',
+       uf_dx_hints %>% filter(dx_count == 1 & grepl('Hospital', first_dx_type)) %>% nrow())
+```
+
+```{r, eval=FALSE}
+# look into those with location on first dx date but no form of confirmation on same date
+uf_dx_hints %>% 
+  filter(first_location_date==first_dx_date & (first_confirm_date > first_dx_date | is.na(first_confirm_date))) %>%
+  left_join(pat_cohort %>% select(pat_id, pat_mrn_id), by ='pat_id') %>%
+  select(pat_mrn_id, pat_id:confident_incident) %>%
+  View()
+
+# look into those with only one billing diagnosis ever
+uf_dx_hints %>% 
+  filter(dx_count == 1 & grepl('Hospital', first_dx_type)) %>%
+  left_join(pat_cohort %>% select(pat_id, pat_mrn_id), by ='pat_id') %>%
+  select(pat_mrn_id, pat_id:confident_incident) %>%
+  View()
+```
+
+# 2.3. Define UF outcome according to EHR phenotypes
+
+`Confident positive` is defined as a UF diagnosis which has some combination of the following hints (in order of confidence):
+
+1. Confirmation of UF Dx following a diagnostic procedure (same day as procedure = most confident)
+
+*Assumption: if a provider drops a diagnosis code within 6 months after diagnostic procedure, the procedure was confirmatory to the presence of fibroids.*
+
+2. Having a diagnostic procedure & any UF Dx after a diagnostic procedure
+
+*Assumption: diagnosis was confirmed during surgery but no code was dropped (either it was treated or presumed resolved, simply missed in coding), later the fibroids are entered into EHR as a historical diagnosis or on problem list*
+
+3. Having location of the fibroid indicated on a diagnosis
+
+*Assumption: the only way a location would be supplied is through some diagnostic procedure even if not noted in their charts.*
+
+4. Pregnancy-related diagnoses
+
+*Assumption: most of these are incidental fibroid diagnoses resulting from imaging related to pregnancy (confirmed by Shilpi). Many of these cases may be asymptomatic but are true incidental cases.*
+
+5. 2 or more referral diagnoses
+
+*Assumption: if patients are being referred multiple times for UF -- this could indicate that they have strong symptomology and/or they are diagnosed by an external provider and then referred to NYU for treatment.*
+
+6. First diagnosis is on the same date as re-engage after LTFU
+
+*Assumption: Patients who receive their first UF Dx on the day they return to relevant care at NYU were likely diagnosed outside of NYU and return to NYU with the new incident diagnosis.*
+
+QUESTION: Should patients diagnosed DURING partial LTFU be included here? Based on dicussion with Anais, these could be encounter diagnoses dropped for the referral (forced by Epic) but is not a confirmed diagnosis.
+
+`Prevalent cases` can be identified via a historical diagnosis (Z86) code at or close (within 2 months) to first dx code
+
+*Assumption: If within two months of the first dx code they also get a code that indicates 'history of endometriosis' there is a good chance that the first diagnosis code was for a prevalent diagnosis.*
+
+# 2.4. Determine final case status {.tabset}
+
+## Confident incident cases
+
+```{r confident_incident_table}
+print(CreateTableOne(data=uf_dx_hints %>% filter(confident_incident), includeNA=TRUE,
+               vars=c('ever_confirmed_6months', 'any_location',
+                      'prevalent_dx_after_proc','ever_pregnancy_related', 'multiple_referral',
+                      'dx_after_partial_LTFU')),
+      showAllLevels = TRUE)
+```
+
+## Hesitant cases (prevalent or incident)
+
+```{r not_confident}
+# subset to cases who are not confident_incident
+df_not_confident <- uf_dx_hints %>%
+  filter(!confident_incident) %>%
+  mutate(only_one_code=ifelse(dx_count==1, TRUE, FALSE)) %>%
+  mutate(dx_early_into_FU = ifelse(time_to_first_dx <= 180, TRUE, FALSE))
+
+# look at overall characteristics
+prevalent_vars = c("first_dx_medical", "time_to_first_dx", "dx_count", "all_medical_hx", "has_surgery", 
+                   "has_imaging", "only_one_code")
+tab_not_confident <- CreateTableOne(data=df_not_confident, vars=prevalent_vars)
+
+print(tab_not_confident,nonnormal="dx_count", showAllLevels = TRUE)
+#procedure_df %>% filter(pat_id %in% df_not_confident$pat_id[which(df_not_confident$has_imaging)]) %>% arrange(pat_id) %>% View()
+```
+
+```{r not_confident_hints_corrplot}
+corrplot.mixed(cor(df_not_confident[,prevalent_vars], use='pairwise.complete.obs'),
+               lower = "number", 
+               upper = "ellipse",
+               tl.cex=0.5,
+               number.cex=0.5,
+               tl.pos = "lt",
+               tl.col = "black") 
+```
+Based on looking at this correlation matrix, the most relevant characteristics of the non-confident cases appears to be having only one code and the first dx code being a medical history code. 
+
+## Investigate censoring among those eventually diagnosed
+
+How many patients are censored prior to their first UF diagnosis code?
+
+Look at censoring date and first diagnosis date for all cases
+```{r}
+uf_dx_info <- uf_dx_hints %>% 
+  left_join(pat_cohort, by='pat_id') %>%
+  mutate(final_censor_type= ifelse(final_censor_type == 'LTFU' & ltfu_status == 'partial', NA, final_censor_type),
+         final_censor_date= case_when(is.na(final_censor_type)~NA, TRUE~final_censor_date),
+         censored_before_dx = case_when(is.na(final_censor_date)~FALSE,
+                                        first_dx_date > final_censor_date~TRUE,
+                                        TRUE~FALSE))
+# print table
+CreateTableOne(data=uf_dx_info, strata='confident_incident', var=c('final_censor_type', 'censored_before_dx'),
+                 includeNA=TRUE, addOverall = TRUE)
+```
+About 30% of cases (regardless of confident status) experience some form of censoring and about 4% of these cases are diagnosed after censoring occurred. This could likely indicate more usage of other healthcare systems in which an incident UF dx occurred and then was at some point communicated back to NYU. 
+
+Look at censoring among those censored before first dx code date
+```{r}
+CreateTableOne(data=uf_dx_info %>% filter(censored_before_dx), strata='confident_incident',
+               var=c('final_censor_type'), includeNA=TRUE, addOverall = TRUE)
+```
+Those who age out or experience menopause might be more likely to be prevalent cases. Finally, those who are censored via surgery may be true cases referred in for surgery with little diagnosis information in NYU EHR -- might want to also look into these. 
+
+```{r, eval=FALSE}
+# look into those censored due to surgery
+procedure_df %>% 
+  filter(pat_id %in% uf_dx_info$pat_id[which(uf_dx_info$censored_before_dx & 
+                                        uf_dx_info$final_censor_type == 'Surgery')]) %>%
+  View()
+
+uf_dx_info %>% filter(censored_before_dx & final_censor_type == 'LTFU') %>% View()
+```
+For many of these cases, the surgery is the one used to diagnose fibroids, so these will be kept as cases. All other censored groups will be left as is.
+
+## {.unnumbered}
+
+# 2.5. Finalize outcome and save files
+
+Add to patient cohort table with flag for case type: if they are censored before diagnosis (unless it is the surgery_confirmed case) then keep them as censored but otherwise use their first Dx date as their censor date
+```{r join_to_pat}
+pat_cohort_uf <- pat_cohort %>%
+  left_join(procedure_df %>% 
+              filter(is_procedure) %>%
+              group_by(pat_id) %>%
+              summarise(ever_imaging = ifelse(sum(method == 'Imaging')>=1, TRUE, FALSE),
+                        ever_surgery = ifelse(sum(method == 'Surgery')>=1, TRUE, FALSE),
+                        .groups='drop'),
+            by='pat_id') %>%
+  left_join(uf_dx_hints %>% 
+              mutate(putative_group = case_when(confident_incident~'Incident case', 
+                                                !confident_incident~'Prevalent case or false positive')) %>%
+              select(pat_id, first_dx_date, putative_group, first_confirm_date, first_confirm_type, first_location_date),
+            by='pat_id') %>%
+  mutate(ever_imaging = case_when(is.na(ever_imaging)~FALSE, TRUE~ever_imaging),
+         ever_surgery = case_when(is.na(ever_surgery)~FALSE, TRUE~ever_surgery),
+         uf_dx = case_when(!is.na(putative_group)~TRUE, TRUE~FALSE),
+         uf_before_censor = case_when(is.na(final_censor_date)~TRUE,
+                                      first_dx_date <= final_censor_date~TRUE,
+                                      TRUE~FALSE),
+         final_censor_type_uf_all = case_when(uf_dx & uf_before_censor~'UF case',
+                                              uf_dx & final_censor_type==first_confirm_type~'UF case',
+                                              TRUE~final_censor_type),
+         final_censor_type_uf_confident = case_when(uf_dx & putative_group == 'Incident case' &
+                                                   uf_before_censor~'UF case', 
+                                                   uf_dx & putative_group == 'Incident case' &
+                                                     final_censor_type==first_confirm_type~'UF case',
+                                                   TRUE~final_censor_type),
+         final_censor_date_uf_all = case_when(final_censor_type_uf_all=='UF case'~first_dx_date, 
+                                              TRUE~as.Date(final_censor_date)),
+         final_censor_date_uf_confident = case_when(final_censor_type_uf_confident == 'UF case'~first_dx_date,
+                                                    TRUE~as.Date(final_censor_date)))
+```
+
+Look at censoring among those censored before first dx code date
+```{r censoring_conflict}
+CreateTableOne(data=pat_cohort_uf, strata='uf_dx', includeNA=TRUE, addOverall = TRUE,
+               var=c('final_censor_type_uf_all', 'final_censor_type_uf_confident'))
+```
+
+Calculate person-time for cohort (including all cases)
+```{r person_time_all}
+pat_cohort_uf %>%
+  mutate(person_years = case_when(is.na(final_censor_date_uf_all)~difftime(last_enc_date, index_enc_date,units='days'),
+                                  TRUE~difftime(final_censor_date_uf_all,index_enc_date,units='days')),
+         person_years = as.numeric(person_years)/365.25) %>%
+  summarise(total_person_time = sum(person_years),
+            n_cases = sum(final_censor_type_uf_all == 'UF case', na.rm=TRUE),
+            uf_incidence_rate = sum(uf_dx)/sum(person_years)*10000)
+```
+Calculate person-time for cohort (only confident cases)
+```{r person_time_confident}
+pat_cohort_uf %>%
+  filter(putative_group != 'Prevalent case or false positive' | is.na(putative_group)) %>%
+  mutate(person_years = case_when(is.na(final_censor_date_uf_confident)~difftime(last_enc_date, index_enc_date,units='days'),
+                                  TRUE~difftime(final_censor_date_uf_confident,index_enc_date,units='days')),
+         person_years = as.numeric(person_years)/365.25) %>%
+  summarise(total_person_time = sum(person_years),
+            n_cases = sum(final_censor_type_uf_confident == 'UF case', na.rm=TRUE),
+            uf_incidence_rate = sum(uf_dx & putative_group == 'Incident case')/sum(person_years)*10000)
+```
+
+Save both dataframes (updated pat_cohort & all_uf_hints)
+```{r save_files}
+write.csv(uf_dx_hints, 'Data/Derived/uf_all_hints.csv', row.names=FALSE)
+write.csv(pat_cohort_uf, 'Data/Derived/Chapter 1/cohort_w_uf.csv', row.names=FALSE)
+```
+

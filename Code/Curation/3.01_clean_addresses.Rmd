@@ -1,0 +1,422 @@
+---
+title: 'Step 3: Clean Address Data'
+author: "Mia Charifson"
+date: "2024-05-14"
+output: 
+  html_document:
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+knitr::opts_knit$set(root.dir = '/Users/miacharifson/Library/CloudStorage/OneDrive-NYULangoneHealth/Charifson Dissertation/')
+
+library(tidyverse)
+library(lubridate)
+library(readxl)
+library(tableone)
+library(data.table)
+```
+
+Last updated on: `r lubridate::today()`.
+
+# Introduction
+
+The document follows the following steps: 
+
+1. join and clean the address data
+2. identify baseline address (closest to index encounter)
+3. filter based on address data
+4. look at moving addresses
+
+```{r load}
+pat_cohort <- read.csv('Data/Derived/pat_cohort_w_censoring.csv') 
+nyc_counties <- read_excel('Data/External/NY_NJ_PA_CT_county_fips.xlsx', 1)
+res_his1 <- read.csv('Data/Epic/table5_addr1.csv')
+res_his2 <- read.csv('Data/Epic/table5_addr2.csv')
+```
+
+# Join and Clean Data
+
+```{r join}
+# join together the files 
+res_his <- bind_rows(res_his1, res_his2) %>% distinct()
+```
+
+```{r filter}
+# subset to patients in the cohort
+res_his <- res_his %>% 
+  filter(pat_id %in% pat_cohort$pat_id) %>% 
+  arrange(pat_id, eff_start_date, eff_end_date)
+```
+
+There are `r length(unique(res_his$pat_id))` patients in the eligible cohort with address data and `r dim(pat_cohort)[1] - length(unique(res_his$pat_id))` patients without address data.
+
+```{r grab_geoid}
+# select the correct GEOID for the year of the address
+res_his <- res_his %>%
+  mutate(across(where(is.character), ~na_if(., "NULL"))) %>%
+  mutate(eff_start_date = as.Date(eff_start_date), 
+         eff_end_date = as.Date(eff_end_date), 
+         census_tract_final = ifelse(year(eff_start_date)<2020, 
+                                     census_tract_code_2010, census_tract_code_2020),
+         full_fips_tract_final = ifelse(year(eff_start_date)<2020, 
+                                        full_fips_tract_2010, full_fips_tract_2020)) %>%
+  select(pat_id, geo_addr_id, eff_start_date, eff_end_date, census_tract_final, 
+         full_fips_tract_final, source, accuracy_type, accuracy_score)
+```
+
+```{r unique_dates}
+# collapse the same address across multiple dates
+res_his_unique <- data.table(res_his)
+# remove rows that start and end on the same day (these seem to be errors)
+#res_his_unique <- res_his_unique[eff_start_date == eff_end_date, ]
+# make address groups
+z <-  rle(paste0(res_his_unique$pat_id, res_his_unique$full_fips_tract_final))
+res_his_unique$addr_group <- rep(1:length(z$lengths),z$lengths)
+# summarise info for a given address group
+res_his_unique <- res_his_unique[, .(eff_start_date_min = min(as.Date(eff_start_date)), 
+                                     eff_end_date_max = max(as.Date(eff_end_date)),
+                                     max_accuracy_score = max(as.numeric(accuracy_score))), 
+                                 by = .(pat_id, census_tract_final, full_fips_tract_final, addr_group)]
+# head(res_his_unique)
+```
+
+`r round(length(which(res_his_unique$max_accuracy_score < 0.6))/dim(res_his_unique)[1]*100, 2)`% of addresses in the table are of poor accuracy (accuracy score < 0.6).
+
+```{r save_raw_addr}
+write.csv(res_his_unique, 'Data/Derived/Chapter 1/all_cohort_addresses.csv', row.names=FALSE)
+```
+
+```{r explore_geoids, include=FALSE}
+## explore the distribution of census tracts
+table(substr(res_his_unique$full_fips_tract_final, 1, 2))
+# the most populous are NY, NJ, PA, CT and to a lesser extent CA, MA, MD, DC and GA
+length(which(!substr(res_his_unique$full_fips_tract_final, 1, 2) %in% c(36, 34, 09, 42)))
+length(unique(res_his_unique$pat_id[which(!substr(res_his_unique$full_fips_tract_final, 1, 2) %in% c(36, 34, 09, 42))]))
+# look at only NYC counties
+table(substr(res_his_unique$full_fips_tract_final, 1, 5))
+# filter to only those with a nyc county fips
+length(unique(res_his_unique$pat_id[which(substr(res_his_unique$full_fips_tract_final, 1, 5) %in% nyc_counties$`State County fips`)]))
+# 74120 patients
+```
+
+# Identify Baseline Address
+
+```{r join_pat}
+res_his_unique <- left_join(res_his_unique, pat_cohort[c("pat_id", "index_enc_date")], by="pat_id")
+```
+
+```{r add_before_index, include=FALSE}
+# how many patients have an address prior to their index encounter
+length(unique(res_his_unique$pat_id[which(res_his_unique$eff_start_date_min <= res_his_unique$index_enc_date)]))
+# 81877
+```
+
+```{r baseline_group}
+## define baseline address
+res_his_baseline <- res_his_unique %>%
+  mutate(baseline_addr = case_when(index_enc_date < eff_end_date_max & index_enc_date >= eff_start_date_min~TRUE, 
+                                   # if they have one address that has no end date then baseline_addr is true
+                                   index_enc_date >= eff_start_date_min & is.na(eff_end_date_max)~TRUE,
+                                   TRUE~FALSE),
+         addr_time_margin = case_when(baseline_addr~NA,
+                                      index_enc_date < eff_start_date_min~
+                                        difftime(index_enc_date, eff_start_date_min, units = 'day'),
+                                      index_enc_date > eff_end_date_max~
+                                        difftime(index_enc_date, eff_end_date_max, units = 'day')),
+         length_residence = case_when(!is.na(eff_end_date_max)~
+                                        as.numeric(difftime(eff_end_date_max, eff_start_date_min, units='day')),
+                                      is.na(eff_end_date_max)~
+                                        as.numeric(difftime("2023-08-01", eff_start_date_min, units='day'))))
+```
+
+```{r check_baseline, include=FALSE}
+# check who has an exact baseline address
+table(res_his_baseline$baseline_addr) ## seems pretty good
+length(unique(res_his_baseline$pat_id[which(res_his_baseline$baseline_addr)])) 
+## almost everyone has a baseline address
+
+# look at those without an exact baseline address
+summary(as.numeric(res_his_baseline$addr_time_margin))
+
+# look at these patients
+res_his_baseline %>% group_by(pat_id) %>% filter(sum(baseline_addr) == 0) %>% View()
+```
+
+There are `r length(unique(res_his_baseline$pat_id[which(res_his_baseline$baseline_addr)]))` patients with an exact baseline address (i.e. the effective start and end date of the address includes the index date). This is almost all patients. 
+
+For the remainder, we could use the closest address based on time margin to the index encounter date. Based on looking at the dates available, I will choose patients who have an address within one year of the index encounter.
+
+```{r baseline_unique}
+# this is very few patients and most of them are very close except a handful of patients
+res_his_baseline <- res_his_baseline %>%
+  group_by(pat_id) %>%
+  mutate(baseline_addr = case_when(abs(addr_time_margin)==min(abs(addr_time_margin)) & 
+                                     as.numeric(abs(addr_time_margin))<=365~TRUE,
+                                   TRUE~baseline_addr)) %>%
+  ungroup()
+
+# look at time margin
+#summary(as.numeric(res_his_baseline$addr_time_margin[which(res_his_baseline$baseline_addr)]))
+```
+
+This is n=`r length(unique(res_his_baseline$pat_id[which(!is.na(res_his_baseline$addr_time_margin) & res_his_baseline$baseline_addr)]))` patients. 
+
+# Exclusions based on address data {.tabset}
+
+## Has baseline address
+
+Patients must have available baseline address data to be included in the cohort. 
+
+```{r has_baseline}
+# filter to baseline address for each patient
+res_his_baseline_unique <- res_his_baseline %>% 
+  filter(baseline_addr)
+
+no_baseline_addr <- res_his %>% filter(!pat_id %in% res_his_baseline_unique$pat_id) %>% distinct(pat_id)
+```
+
+There are `r length(unique(no_baseline_addr$pat_id))` patients who do not have an address at baseline.
+
+```{r has_baseline_check, include=FALSE}
+# check that all patients have only one baseline census tract
+res_his_baseline_unique %>% group_by(pat_id) %>% filter(n()>1) %>% nrow()
+res_his %>% 
+  filter(pat_id %in% res_his_baseline_unique$pat_id[which(duplicated(res_his_baseline_unique$pat_id))]) %>% 
+  View()
+```
+
+```{r baseline_remove_duplicates}
+## duplicates to remove are duplicates who have no end date
+res_his_baseline_unique <- res_his_baseline_unique %>% 
+  group_by(pat_id) %>% 
+  filter(n()==1 | (length_residence!=0)) %>%
+  ungroup()
+
+#res_his_baseline_unique %>% group_by(pat_id) %>% filter(n()>1) %>% nrow()
+```
+
+## Lives in NYC-Newark CSA
+
+Patients must live in the NYC-Newark CSA at baseline to be included in the cohort. 
+
+```{r explore_ny_csa, include=FALSE}
+## explore the distribution of census tracts
+table(substr(res_his_baseline_unique$full_fips_tract_final, 1, 2))
+# the most populous are NY, NJ, PA, CT and to a lesser extent CA, MA, MD, DC and GA
+length(which(!substr(res_his_baseline_unique$full_fips_tract_final, 1, 2) %in% c(36, 09, 34, 42)))
+length(unique(res_his_baseline_unique$pat_id[which(!substr(res_his_baseline_unique$full_fips_tract_final, 1, 2) %in% c(36, 09, 34, 42))]))
+# around 495 are not from NY
+# look at only NYC counties
+table(substr(res_his_baseline_unique$full_fips_tract_final, 1, 5))
+# filter to only those with a nyc county fips
+length(unique(res_his_baseline_unique$pat_id[which(!substr(res_his_baseline_unique$full_fips_tract_final, 1, 5) %in% nyc_counties$`State County fips`)]))
+## look at ages of those who do not live in NYC
+res_his_baseline_unique %>%
+  left_join(pat_cohort, by = 'pat_id') %>%
+  filter(!substr(res_his_baseline_unique$full_fips_tract_final, 1, 5) %in% nyc_counties$`State County fips`) %>%
+  ggplot(data=., aes(x=age_20160801)) +
+  geom_histogram(bins=20)
+# they are generally young on average (under 25 years), confirming Linda's suspicion
+```
+
+```{r lives_in_nyc}
+# filter them out and move on
+non_nyc_ids <- res_his_baseline_unique %>% 
+  filter(!substr(res_his_baseline_unique$full_fips_tract_final, 1, 5) %in% nyc_counties$`State County fips`)
+
+res_his_baseline_unique <- res_his_baseline_unique %>% 
+  filter(substr(res_his_baseline_unique$full_fips_tract_final, 1, 5) %in% nyc_counties$`State County fips`)
+```
+
+There are `r length(unique(non_nyc_ids$pat_id))` patients who do not live in NYC-NJ CSA at baseline.
+
+## High enough accuracy baseline address
+
+We consider high enough accuracy address data to be those with an accuracy score above 0.6. I checked to see if those with low accuracy baseline addresses could be backfilled with another address close to the index encounter data, but most of these close addresses were also of low accuracy for these patients, so it did not seem worthwhile.
+
+```{r explore_accuracy, include=FALSE}
+# look at accuracy score of patients with baseline census tracts
+length(which(res_his_baseline_unique$max_accuracy_score < 0.6)) #1788
+
+# for those with low accuracy look at their other address
+res_his %>%
+  filter(pat_id %in% 
+           unique(res_his_baseline_unique$pat_id[which(res_his_baseline_unique$max_accuracy_score < 0.6)])) %>%
+  left_join(res_his_baseline_unique, by='pat_id') %>%
+  select(pat_id, index_enc_date, eff_start_date, eff_end_date, full_fips_tract_final.x, contains('accuracy')) %>%
+  View()
+
+# some of these patients have an address directly prior which has an accuracy score of 1
+res_his_baseline %>%
+  filter(pat_id %in% 
+           unique(res_his_baseline_unique$pat_id[which(res_his_baseline_unique$max_accuracy_score < 0.6)])) %>%
+  select(pat_id, index_enc_date, eff_start_date_min, eff_end_date_max, full_fips_tract_final, contains('accuracy'), addr_time_margin) %>%
+  View()
+
+## how many could be filled in by another baseline_address with a better accuracy score
+res_his_baseline %>%
+  filter(pat_id %in% 
+           unique(res_his_baseline_unique$pat_id[which(res_his_baseline_unique$max_accuracy_score < 0.6)])) %>%
+  group_by(pat_id) %>%
+  mutate(better_accuracy_baseline = ifelse(lead(baseline_addr) & 
+                                             max_accuracy_score >= 0.6 & addr_time_margin <= 180,
+                                           TRUE, FALSE)) %>%
+  filter(better_accuracy_baseline) %>%
+  nrow()
+## this recoups 173 patients out of 1813 -- doesn't seem worth it
+```
+
+```{r high_accuracy}
+## identify low accuracy ids
+low_accuracy_ids <- res_his_baseline_unique %>% 
+  filter(max_accuracy_score < 0.6) %>% 
+  left_join(res_his %>% 
+              select(pat_id, census_tract_final, accuracy_type, source), 
+            by=c('pat_id', 'census_tract_final')) %>%
+  distinct()
+
+## subset to those with high accuracy
+res_his_baseline_unique <- res_his_baseline_unique %>% filter(max_accuracy_score >= 0.6)
+```
+
+There are `r length(unique(low_accuracy_ids$pat_id))` patients with low accuracy baseline addresses.
+
+```{r explore_low_accuracy, include=FALSE}
+table(low_accuracy_ids$source) # predominantly US Census
+table(low_accuracy_ids$accuracy_type) # predominantly place (zipcode or city centroid)
+table(low_accuracy_ids$max_accuracy_score) # predominantly 0.5
+table(low_accuracy_ids$full_fips_tract_final) 
+```
+
+## Final address cohort
+
+The final number of patients with eligible baseline address data is n=`r length(which(res_his_baseline_unique$baseline_addr))`.
+
+```{r final_addresses}
+# write out the file
+write.csv(res_his_baseline_unique, 'Data/Derived/Chapter 1/baseline_cohort_addresses.csv', row.names=FALSE)
+```
+
+## {.unnumbered}
+
+# Moving addresses {.tabset}
+
+## Group length of residence by relativity to baseline address
+```{r address_weights}
+res_his_weights <- res_his_baseline %>%
+  filter(pat_id %in% res_his_baseline_unique$pat_id) %>%
+  mutate(res_his_type = case_when(baseline_addr~'baseline',
+                                  eff_start_date_min >= index_enc_date~'during follow-up',
+                                  eff_end_date_max <= index_enc_date~'before baseline')) %>%
+  group_by(pat_id, res_his_type, full_fips_tract_final) %>%
+  summarise(length_residence_months = sum(length_residence, na.rm=TRUE)/30,
+            .groups='drop') %>%
+  group_by(pat_id, res_his_type) %>%
+  mutate(total_length_per_type = sum(length_residence_months, na.rm=TRUE)) %>%
+  ungroup() %>%
+  group_by(pat_id) %>%
+  mutate(total_length_res_his = sum(length_residence_months, na.rm=TRUE)) %>%
+  ungroup() %>%
+  mutate(weight_res_his = length_residence_months/total_length_res_his,
+         weight_res_type = length_residence_months/total_length_per_type)
+
+res_his_weights %>%
+  group_by(res_his_type) %>%
+  summarise(count=n(), .groups='drop')
+
+# write out the file
+write.csv(res_his_weights, 'Data/Derived/Chapter 1/cohort_addresses_weights.csv', row.names=FALSE)
+```
+
+## Leave NYC during baseline
+
+```{r leave_nyc}
+res_fu_not_nyc <- res_his_baseline %>%
+  # they have a baseline address in NYC
+  filter(pat_id %in% res_his_baseline_unique$pat_id & !is.na(full_fips_tract_final)) %>%
+  # the address is during follow-up
+  filter(eff_start_date_min >= index_enc_date) %>%
+  # the FU address is not within nyc
+  filter(!substr(full_fips_tract_final, 1, 5) %in% nyc_counties$`State County fips`)
+```
+
+There are `r length(unique(res_fu_not_nyc$pat_id))` patients with an address outside NYC at some point during follow-up. These patients are still receiving relevant care but they are now outside our designated geography for observation. I will record what date this is so we can exclude them in a sensitivty analysis if needed. 
+
+```{r explore_left_nyc, include=FALSE}
+# how many move back into NYC (i.e. their last eff_start_date_min is not their max not NYC eff_start_date_min)
+n_last_addr_notNYC <- res_his_baseline %>% 
+  filter(pat_id %in% res_fu_not_nyc$pat_id) %>%
+  group_by(pat_id) %>% 
+  arrange(desc(eff_start_date_min)) %>% 
+  slice(1) %>% 
+  ungroup() %>%
+  left_join(res_fu_not_nyc %>% 
+              group_by(pat_id) %>% 
+              arrange(desc(eff_start_date_min)) %>% 
+              slice(1) %>% 
+              ungroup(),
+            by='pat_id', suffix = c('_all', '_notNYC')) %>%
+  filter(eff_start_date_min_all == eff_start_date_min_notNYC) %>%
+  nrow()
+```
+
+For most of these patients (n=`r n_last_addr_notNYC`), their last address in the address table is an address outside of NYC. This means they moved out of NYC for good.
+
+```{r notNYC_states}
+state_fips <- read.csv('Data/External/state_fips.csv', colClasses = c(state_fips = "character"))
+
+res_fu_not_nyc %>%
+  mutate(state_fips = substr(full_fips_tract_final, 1, 2)) %>%
+  distinct(pat_id, state_fips) %>%
+  left_join(state_fips, by = "state_fips") %>%
+  CreateTableOne(var="state_abbr", data=.)
+```
+
+```{r leave_nyc_pat}
+## make final patient file with address indicated
+pat_cohort_w_address <- pat_cohort %>% 
+  select(pat_id, final_censor_date, final_censor_type) %>%
+  left_join(res_his_baseline_unique %>% 
+              select(pat_id, census_tract_final, full_fips_tract_final, max_accuracy_score),
+            by='pat_id') %>%
+  mutate(addr_NA_reason = case_when(!is.na(census_tract_final)~NA,
+                                    !pat_id %in% res_his$pat_id~'No address data', 
+                                    pat_id %in% no_baseline_addr$pat_id~'No baseline address',
+                                    pat_id %in% non_nyc_ids$pat_id~'Outside of NY-Newark CSA',
+                                    pat_id %in% low_accuracy_ids$pat_id~'Low accuracy score'))
+
+## add earliest date of leaving NYC and replace censoring date with this if earlier/NA
+res_fu_not_nyc_unique <- res_fu_not_nyc %>%
+  group_by(pat_id) %>%
+  arrange(eff_start_date_min) %>%
+  slice(1) %>%
+  ungroup() %>%
+  mutate(state_fips = substr(full_fips_tract_final, 1, 2)) %>%
+  left_join(state_fips, by = "state_fips") %>%
+  select(pat_id, full_fips_tract_final, eff_start_date_min) %>%
+  rename(not_nyc_full_fips = full_fips_tract_final, 
+         move_out_nyc_date = eff_start_date_min)
+
+## add to pat_cohort file
+pat_cohort_w_address <- pat_cohort_w_address %>%
+  left_join(res_fu_not_nyc_unique, by='pat_id') %>%
+  mutate(final_censor_date = as.Date(final_censor_date)) %>%
+  mutate(censor_address_date = case_when(is.na(final_censor_date) & !is.na(move_out_nyc_date)~move_out_nyc_date,
+                                         move_out_nyc_date < final_censor_date~move_out_nyc_date,
+                                         TRUE~final_censor_date),
+         censor_address_type = case_when(is.na(final_censor_date) & !is.na(move_out_nyc_date)~'Left NYC-NJ CSA',
+                                         move_out_nyc_date < final_censor_date~'Left NYC-NJ CSA',
+                                         TRUE~final_censor_type))
+
+CreateTableOne(data=pat_cohort_w_address, var='censor_address_type')
+```
+
+```{r final_pat_addresses}
+# write out the file
+write.csv(pat_cohort_w_address, 'Data/Derived/Chapter 1/pat_cohort_w_address.csv', row.names=FALSE)
+```
+
+## {.unnumbered}
+

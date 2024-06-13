@@ -1,0 +1,683 @@
+---
+title: "Chapter 2 Descriptives"
+author: "Mia Charifson"
+date: "2024-04-01"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+knitr::opts_knit$set(root.dir = '/Users/miacharifson/Library/CloudStorage/OneDrive-NYULangoneHealth/Charifson Dissertation/')
+
+library(DiagrammeR)
+library(tidyverse)
+library(ggplot2)
+library(readxl)
+library(dplyr)
+library(lubridate)
+library(arsenal)
+```
+
+Last updated on: `r `today()`.
+
+# Chapter Two
+
+This is an R Markdown document which documents the following: 
+ 
+(1) The final analytic and complete case sample size for Chapter 2 
+(2) Descriptive statistics for Chapter 2
+(3) Exploratory descriptive statistics
+
+```{r load_data}
+uf_cohort <- read.csv('Data/Derived/uf_all_hints.csv')
+endo_cohort <- read.csv('Data/Derived/endo_all_hints.csv')
+false_negatives <- read.csv('Data/Derived/putative_false_negatives.csv')
+covars <- read.csv('Data/Derived/clean_covariates.csv')
+pat_cohort <- read.csv('Data/Derived/pat_cohort_w_censoring.csv')
+ttd_symptoms <- read.csv('Data/Derived/Chapter 2/pat_cohort_w_ttd.csv')
+pat_symptom_status <- read.csv('Data/Derived/Chapter 2/pat_cohort_symptom_status.csv')
+address <- read.csv('Data/Derived/Chapter 1/pat_cohort_w_address.csv', 
+                    colClasses = c(census_tract_final = "character",
+                                   full_fips_tract_final = "character"))
+ever_proc_info <- read.csv('Data/Derived/Chapter 1/cohort_w_uf.csv')
+```
+
+```{r join_covars}
+pat_w_covars <- pat_cohort %>%
+  select(pat_id, index_enc_date, last_enc_date, all_provider_specialty, age_20160801, hcu_baseline, 
+         hcu_fu, site_baseline, site_fu, insur_status, insur_status_filled, obgyn_care_cohort) %>%
+  rename(index_provider_specialty = all_provider_specialty) %>%
+  left_join(covars %>% select(pat_id, employ_simple_final, race_final, ethnicity_final, race_ethnic_final,
+                              HC_status, parity_binary, language_eng_sp, marital_status_final, bmi_baseline),
+            by='pat_id')
+```
+
+```{r join_outcomes}
+pat_w_outcome <- ttd_symptoms %>%
+  select(pat_id, contains('uf'), contains('endo'), final_outcome_status, final_censor_date_outcome, 
+         final_censor_type_outcome, contains('symptom'), contains('ttd')) %>%
+  rename(final_censor_date = final_censor_date_outcome, 
+         final_censor_type = final_censor_type_outcome,
+         time_to_dx = ttd,
+         time_to_dx_2symptoms = ttd_2)
+```
+
+```{r join_address, include=FALSE}
+# join to the address data for people who leave NYC censoring
+pat_w_exposure <- address %>%
+  select(-final_censor_date, -final_censor_type)
+```
+
+## Final sample size
+
+```{r ch2_cohort}
+# exclude those deemed confident prevalents
+confident_prevalents <- rbind(uf_cohort %>% filter(confident_prevalent) %>% select(pat_id), 
+                              endo_cohort %>% filter(confident_prevalent) %>% select(pat_id)) %>%
+  distinct(pat_id)
+
+# exclude those who do not live in NYC or site_baseline == 'Florida'
+not_in_nyc <- address %>% 
+  filter(addr_NA_reason != 'Low accuracy score' & !is.na(addr_NA_reason)) %>%
+  select(pat_id) %>%
+  left_join(pat_w_covars %>% 
+              filter(site_baseline == 'FLORIDA') %>%
+              select(pat_id), by='pat_id')
+
+ch2_cohort <- pat_w_outcome %>%
+  # remove if not disease free at baseline
+  filter(!pat_id %in% confident_prevalents$pat_id) %>%
+  # remove if they do not live in NY-Newark CSA? %>%
+  inner_join(address %>% 
+               filter(is.na(addr_NA_reason) | addr_NA_reason == 'Low accuracy score') %>%
+               select(pat_id),
+             by='pat_id') %>%
+  left_join(pat_w_covars, by='pat_id') %>%
+  filter(site_baseline != 'FLORIDA') %>%
+  mutate(included = case_when(!uf_confident_incident & 
+                                (!endo_confident_incident | is.na(endo_confident_incident))~'No',
+                              !endo_confident_incident & 
+                                (!uf_confident_incident | is.na(uf_confident_incident))~'No',
+                              TRUE~'Yes'),
+         two_symptom_cohort = !is.na(time_to_dx_2symptoms) & included=='Yes')
+```
+
+```{r ch2_cohort_Ns, eval=FALSE}
+# Eligible cohort
+ch2_cohort %>% distinct(pat_id) %>% nrow()
+# How many were excluded based on site/address
+not_in_nyc %>% distinct(pat_id) %>% nrow()
+# Included 
+ch2_cohort %>% filter(included=='Yes') %>% nrow()
+# Has complete exposure data
+ch2_cohort %>% filter(!is.na(race_ethnic_final) & !is.na(insur_status) & !is.na(language_eng_sp)) %>% nrow()
+# Is excluded due predictor status
+ch2_cohort %>% filter(is.na(race_ethnic_final)) %>% nrow()
+ch2_cohort %>% filter(is.na(insur_status)) %>% nrow()
+ch2_cohort %>% filter(is.na(language_eng_sp)) %>% nrow()
+# Symptom count
+ch2_cohort %>% filter(two_symptom_cohort) %>% nrow() # have at least two symptoms
+ch2_cohort %>% filter(!two_symptom_cohort & included=='Yes') %>% nrow() # excluded-only have one symptom
+```
+
+Chapter two eligibility includes:
+
+Additional eligibility exclusions: 
+
+- all identified confident prevalent cases are excluded
+- Not eligible (lived outside NYC, included Florida as baseline site)
+
+Reasons for exclusions:
+
+- Patient never reports a symptom
+- Patient reports a symptom prior to index encounter
+- Outcome could not be ascertained (hesitant cases)
+- Missing exposure data (this will be imputed but still report number)
+- Sensitivity analysis: Patient only reports one symptom during follow-up
+
+```{r ch2_sample_size}
+### Need to figure out how to make off shoots for excluded cases
+### draw line from an edge to a node
+DiagrammeR::grViz("digraph {
+  graph [layout = dot, rankdir = TB]
+  
+  node [shape = rectangle]        
+  rec1 [label = 'Patients with symptom during follow-up (n=23,374)']
+  rec2 [label = 'Complete Outcome Data (n=23,052)']
+  rec3 [label = 'Final sample size (n=23,052)']
+  rec4 [label = 'Reports at least two symptoms (n=18,848)']
+  rec5 [label = 'Complete Exposure Data (n=18,747)']
+  rec6 [label = 'Missing race/ethnicity (n=2,189)']
+  rec7 [label = 'Missing insurance status (n=1,824)']
+  rec8 [label = 'Missing preferred language (n=41)']
+  rec9 [label = 'Excluded for lacking symptoms (n=49,249)']
+  rec10 [label = 'Reported symptom prior to baseline (n=7,685)']
+  rec11 [label = 'Never reported symptom (n=41,564)']
+  # edge definitions with the node IDs
+  rec1 -> rec2 -> rec3 -> rec4
+  rec5 -> rec6 -> rec7 -> rec8
+  rec9 -> rec10 -> rec11
+  }", height = 500)
+```
+
+```{r ch2_final_data}
+ch2_final <- ch2_cohort %>% 
+  filter(included=='Yes') %>%
+  mutate(symptom_group = case_when(grepl('R10.2|F52.6|N94.1|N94.0|M54.5', first_symptom_icd10s)~'Pain',
+                                  grepl('N94.[4-6]|N93.0|N93.8|N93.9|N92.0|N92.1|D50.0',
+                                             first_symptom_icd10s)~'Menstrual/Bleeding',
+                                  grepl('N83.0|N83.2|N73.9', first_symptom_icd10s)~'PID/Ovarian cysts',
+                                  grepl('N97.9', first_symptom_icd10s)~'Infertility',
+                                  grepl('N32.9|K59.00|N39.3|R19.7', first_symptom_icd10s)~
+                                    'Other Genito-urinary')) %>%
+  mutate(final_outcome_group = case_when(grepl('Both', final_outcome_status)~'Both',
+                                         TRUE~final_outcome_status),
+         time_to_dx_cat = case_when(time_to_dx < 6~'Under 6 months',
+                                    time_to_dx >= 6 & time_to_dx < 12 ~'6-12 months',
+                                    time_to_dx >= 12 & time_to_dx < 24 ~'12-48 months',
+                                    time_to_dx >= 48 & time_to_dx < 60 ~'48-72 months',
+                                    time_to_dx >= 72 ~'72+ months'),
+         time_to_dx_cat = factor(time_to_dx_cat, levels = c('Under 6 months', '6-12 months',
+                                                            '12-48 months', '48-72 months',
+                                                            '72+ months')))
+
+write.csv(ch2_final, 'Data/Derived/Chapter 2/final_dataset_20240516.csv', row.names = FALSE)
+
+## Sample flags
+ch2_sample <- pat_cohort %>%
+  filter(!pat_id %in% confident_prevalents$pat_id) %>%
+  left_join(ch2_cohort %>% select(pat_id, included, symptom_count, two_symptom_cohort), by='pat_id') %>%
+  mutate(ch2_main = ifelse(included=='Yes', TRUE, FALSE),
+         ch2_obgyn_cohort = ifelse(included=='Yes' & obgyn_care_cohort, TRUE, FALSE),
+         ch2_all_cases = ifelse(!pat_id %in% not_in_nyc$pat_id & symptom_count >= 1, TRUE, FALSE),
+         ch2_two_symptoms = ifelse(two_symptom_cohort, TRUE, FALSE)) %>%
+  select(pat_id, contains('ch2'))
+
+write.csv(ch2_final, 'Data/Derived/Chapter 2/sample_flags_20240529.csv', row.names = FALSE)
+```
+
+## Descriptive statistics {.tabset}
+
+### Outcome: Time to diagnosis {.tabset}
+
+#### First Symptom Group & Timing
+
+```{r all_outcomes, results='asis'}
+summary(tableby(~time_to_dx + symptom_group + final_outcome_group + symptom_count, data=ch2_final),
+        labelTranslations = list(time_to_dx = 'Time from Symptom to Censor (months)',
+                                 symptom_group = 'First Symptom Group',
+                                 final_outcome_group = 'Outcome Group',
+                                 symptom_count = 'Symptom Count'))
+```
+
+```{r ttd_hist}
+ggplot(aes(x=time_to_dx), data=ch2_final) + 
+  geom_histogram(bins=20, fill = 'purple', color='white') +
+  xlab('Time to Diagnosis (months)') +
+  theme_bw()
+```
+
+#### TTD by First Symptom Group
+
+```{r ttd_by_outcome_tab, results='asis'}
+summary(tableby(final_outcome_group~time_to_dx, data=ch2_final,
+                numerics.stats=c('Nmiss', 'N', 'meansd', 'median', 'q1q3')),
+        labelTranslations = list(time_to_dx = 'Time from Dx or Censor (months)'))
+```
+
+```{r ttd_by_outcome}
+ggplot(aes(x=time_to_dx, y=symptom_group, fill=symptom_group), data=ch2_final) + 
+  geom_boxplot() + 
+  ylab('First Symptom Group') +
+  xlab('Time to Diagnosis (months)') +
+  theme_bw() +
+  theme(legend.position = 'bottom')
+```
+
+#### TTD by Outcome Status
+
+```{r ttd_by_symptom}
+ggplot(aes(x=time_to_dx, y=final_outcome_group, fill=final_outcome_group), data=ch2_final) + 
+  geom_boxplot() + 
+  ylab('Outcome Status') +
+  xlab('Time to Diagnosis (months)') +
+  theme_bw() +
+  theme(legend.position = 'bottom')
+```
+#### {.unnumbered}
+
+### Table 1: Cohort characteristics
+```{r table1_pat, results='asis'}
+pat_labs <- list(hcu_baseline='Healthcare utilization (visits/baseline year)',
+                 age_20160801='Age (years)',
+                 HC_status='Hormonal contraceptive use',
+                 parity_binary='Parity status',
+                 marital_status_final='Relationship status',
+                 bmi_baseline='Body mass index (kg/m^2)')
+
+# patient information
+summary(tableby(~hcu_baseline+age_20160801+HC_status+parity_binary+marital_status_final+bmi_baseline,
+                data=ch2_final), labelTranslations = pat_labs)
+```
+
+```{r table1_ses, results='asis'}
+ses_labs <- list(site_baseline='Most common care site (baseline)',
+                 insur_status='Insurance type',
+                 employ_simple_final='Employment status',
+                 race_ethnic_final='Racial and Ethnic Group',
+                 language_eng_sp='Preferred language')
+
+# ses information
+summary(tableby(~site_baseline+insur_status+employ_simple_final+race_ethnic_final+language_eng_sp,
+                data=ch2_final), labelTranslations = ses_labs)
+```
+
+### {.unnumbered}
+
+## Bivariate statistics {.tabset}
+### Predictors-Outcome {.tabset}
+
+Summary of observations -- patients with longer time to diagonsis are/had: 
+
+- highest HCU use at baseline
+- youngest
+- most likely to use HC
+- most likely to be nulliparous
+- most likely to be unpartnered
+- most likely to be at Nassau/Staten OP and FHC, least likely to be at Manhattan OP
+- more likely to be a student/unemployed
+- more likely to be Hispanic
+- more likely to be a Spanish speaker
+
+#### All patient characteristics
+
+```{r pred_ttd_pat, results='asis'}
+summary(tableby(time_to_dx_cat~hcu_baseline+age_20160801+HC_status+parity_binary+
+                  marital_status_final+bmi_baseline, data=ch2_final), 
+        labelTranslations = pat_labs)
+```
+
+```{r pred_ttd_ses, results='asis'}
+summary(tableby(time_to_dx_cat~site_baseline+insur_status+employ_simple_final+
+                  race_ethnic_final+language_eng_sp, data=ch2_final), 
+        labelTranslations = ses_labs)
+```
+
+#### By insurance status
+
+```{r ttd_by_insur}
+ggplot(aes(x=time_to_dx, y=insur_status, fill=insur_status), data=ch2_final) + 
+  geom_boxplot() + 
+  ylab('Insurance Status') +
+  xlab('Time to Diagnosis (months)') +
+  facet_wrap(~final_outcome_group, nrow=2) +
+  theme_bw() +
+  theme(legend.position = 'bottom')
+```
+
+##### Among all patients
+
+```{r ttd_by_insur_all, results='asis'}
+summary(tableby(insur_status~time_to_dx, data=ch2_final,
+                numeric.stats=c('Nmiss', 'N', 'meansd', 'median', 'q1q3')), 
+        labelTranslations = list(time_to_dx = 'Time to Dx or Censoring (months)'))
+```
+
+##### Among those with a diagnosis
+
+```{r ttd_by_insur_dx, results='asis'}
+summary(tableby(insur_status~time_to_dx, data=ch2_final %>% filter(final_censor_type =='Case'),
+                numeric.stats=c('Nmiss', 'N', 'meansd', 'median', 'q1q3')), 
+        labelTranslations = list(time_to_dx = 'Time to Dx or Censoring (months)'))
+```
+
+#### By race-ethnicity
+
+```{r ttd_by_race_ethnic_fig}
+ggplot(aes(x=time_to_dx, y=race_ethnic_final, fill=race_ethnic_final), data=ch2_final) + 
+  geom_boxplot() + 
+  ylab('Racial Ethnic Group') +
+  xlab('Time to Diagnosis (months)') +
+  facet_wrap(~final_outcome_group, nrow=2) +
+  theme_bw() +
+  theme(legend.position = 'bottom')
+```
+
+##### Among all patients
+
+```{r ttd_by_race_ethnic_all, results='asis'}
+summary(tableby(race_ethnic_final~time_to_dx, data=ch2_final,
+                numeric.stats=c('Nmiss', 'N', 'meansd', 'median', 'q1q3')), 
+        labelTranslations = list(time_to_dx = 'Time to Dx or Censoring (months)'))
+```
+
+##### Among those with a diagnosis
+
+```{r ttd_by_race_ethnic_dx, results='asis'}
+summary(tableby(race_ethnic_final~time_to_dx, data=ch2_final %>% filter(final_censor_type =='Case'),
+                numeric.stats=c('Nmiss', 'N', 'meansd', 'median', 'q1q3')), 
+        labelTranslations = list(time_to_dx = 'Time to Dx or Censoring (months)'))
+```
+
+#### By preferred language
+
+```{r ttd_by_language_fig}
+ggplot(aes(x=time_to_dx, y=language_eng_sp, fill=language_eng_sp), data=ch2_final) + 
+  geom_boxplot() + 
+  ylab('Preferred Language') +
+  xlab('Time to Diagnosis (months)') +
+  facet_wrap(~final_outcome_group, nrow=2) +
+  theme_bw() +
+  theme(legend.position = 'bottom')
+```
+
+##### Among all patients
+
+```{r ttd_by_language_all, results='asis'}
+summary(tableby(language_eng_sp~time_to_dx, data=ch2_final,
+                numeric.stats=c('Nmiss', 'N', 'meansd', 'median', 'q1q3')), 
+        labelTranslations = list(time_to_dx = 'Time to Dx or Censoring (months)'))
+```
+
+##### Among those with a diagnosis
+
+```{r ttd_by_language_dx, results='asis'}
+summary(tableby(language_eng_sp~time_to_dx, data=ch2_final %>% filter(final_censor_type =='Case'),
+                numeric.stats=c('Nmiss', 'N', 'meansd', 'median', 'q1q3')), 
+        labelTranslations = list(time_to_dx = 'Time to Dx or Censoring (months)'))
+```
+
+#### {.unnumbered}
+
+### LTFU vs. not LTFU
+
+Summary of observations -- patients who were LTFU are/had: 
+
+- younger
+- more likely to use HC
+- more likely to be nulliparous
+- more likely to be unpartnered
+- lower BMI
+- more likely to be at Manhattan/Westchester/Staten OP, least likely to be at FHC & Nassau OP
+- more likely to be privately insured
+- more likely to be a student
+- more likely to be NH White
+- more likely to be an English speaker
+
+```{r ltfu_covar_pat, results='asis'}
+ch2_final <- ch2_final %>% mutate(ltfu = case_when(final_censor_type == 'LTFU'~TRUE, 
+                                                   TRUE~FALSE))
+# patient information
+summary(tableby(ltfu~hcu_baseline+age_20160801+HC_status+parity_binary+marital_status_final+bmi_baseline,
+                data=ch2_final), labelTranslations = pat_labs)
+```
+
+```{r ltfu_covar_ses, results='asis'}
+# ses information
+summary(tableby(ltfu~site_baseline+insur_status+employ_simple_final+race_ethnic_final+language_eng_sp,
+                data=ch2_final), labelTranslations = ses_labs)
+```
+
+### {.unnumbered}
+
+## Exploratory descriptive statistics {.tabset}
+
+### Table 1 for OBGYN care cohort
+
+Compared to the larger cohort, the OBGYN cohort is/has:
+
+- lower HCU at baseline
+- younger
+- more HC use
+- more nulliparity
+- lower BMI
+- more likely to be at Nassau/State Island OP and less likely to be at FHC
+- more likely to have private insurance
+- less likely to be student
+- more likely to be NH White, less likely to be Hispanic/NH Black
+- more likely to be English speaking
+
+```{r obgyn_tab1, results='asis'}
+summary(tableby(obgyn_care_cohort~hcu_baseline+age_20160801+HC_status+parity_binary+
+                  marital_status_final+bmi_baseline+site_baseline+insur_status+employ_simple_final+
+                  race_ethnic_final+language_eng_sp, data=ch2_final), 
+        labelTranslations = c(pat_labs, ses_labs))
+```
+
+
+### Table 1 for Patients with at least 2 symptoms
+
+Compared to the larger cohort, the 2 symptom cohort is/has:
+
+- higher HCU at baseline
+- slightly older
+- more parous
+- slightly higher BMI
+- more likely to be at FHC, NYU Brooklyn, Tisch and less likely to be at Manhattan/Nassau/Westchester OP
+- more likely to have public insurance
+- more likely to be unemployed
+- more likely to be Hispanic/NH Black, less likely to be NH White
+- more likely to be Spanish speaking
+
+```{r 2symptom_tab1, results='asis'}
+summary(tableby(two_symptom_cohort~hcu_baseline+age_20160801+HC_status+parity_binary+
+                  marital_status_final+bmi_baseline+site_baseline+insur_status+employ_simple_final+
+                  race_ethnic_final+language_eng_sp, data=ch2_final), 
+        labelTranslations = c(pat_labs, ses_labs))
+```
+
+### Never diagnosed patients (those who are administratively censored) {.tabset}
+
+The concern with patients who are never diagnosed or censored is that they may represent patients who will never be diagnosed given infinite follow-up time and therefore, retrospectively are not at risk of a diagnosis. This could also apply to censored patients but we might treat these more like competing risks. 
+
+This section aims to assess who these patients are and if they seem like patients potentially not yet diagnosed or mistakenly included disease-free patients. 
+
+#### Patient characteristics
+
+Summary of observations -- patients who were never diagnosed or censored (vs diagnosed) are/had: 
+
+- much younger
+- more likely to use HC
+- more likely to be nulliparous
+- more likely to be unpartnered
+- have a lower BMI
+- more likely to be at Nassau OP and FHC (never dx only), less likely to be at Manhattan & Staten Island OP
+- slightly likely to have public insurance (never dx only)
+- much more likely to be a student, slightly less likely to be employed
+- less likely to be Hispanic (censored only) and NH Black, much more likely to be NH White
+
+```{r no_dx_covar, results='asis'}
+ch2_final <- ch2_final %>% mutate(never_dx = case_when(is.na(final_censor_type)~'Never Dx', 
+                                                       final_censor_type=='Case'~'Case',
+                                                       TRUE~'Censored'))
+# table
+summary(tableby(never_dx~hcu_baseline+age_20160801+HC_status+parity_binary+marital_status_final+bmi_baseline+
+                  site_baseline+insur_status+employ_simple_final+race_ethnic_final+language_eng_sp,
+                data=ch2_final), 
+        labelTranslations = c(pat_labs, ses_labs))
+```
+
+Among those who have at least two symptoms the differences shrink, but not by much: 
+
+```{r no_dx_covar_2_symptoms, results='asis'}
+summary(tableby(never_dx~hcu_baseline+age_20160801+HC_status+parity_binary+marital_status_final+bmi_baseline+
+                  site_baseline+insur_status+employ_simple_final+race_ethnic_final+language_eng_sp,
+                data=ch2_final %>% filter(two_symptom_cohort)), 
+        labelTranslations = c(pat_labs, ses_labs))
+```
+
+#### Other characteristics
+
+Patients who are never diagnosed or are censored are/have:
+
+- lower total symptoms reported than cases
+- more likely to have infertility, PID, and ovarian cysts
+- much less likely than cases to have imaging/surgery
+
+```{r no_dx_misc, results='asis'}
+ch2_final %>%
+  left_join(ever_proc_info %>% select(pat_id, ever_imaging, ever_surgery), by='pat_id') %>%
+  tableby(never_dx~symptom_count+symptom_group+ever_imaging+ever_surgery, data=.) %>%
+  summary(., labelTranslations = list(symptom_count = 'Symptom count',
+                                   symptom_group = 'First symptom group',
+                                   ever_imaging = 'Ever had related imaging',
+                                   ever_surgery = 'Ever had related surgery'))
+```
+
+Among those who have at least two symptoms the differences shrink: 
+
+```{r no_dx_misc_2_symptoms, results='asis'}
+ch2_final %>%
+  filter(two_symptom_cohort) %>%
+  left_join(ever_proc_info %>% select(pat_id, ever_imaging, ever_surgery), by='pat_id') %>%
+  tableby(never_dx~symptom_count+symptom_group+ever_imaging+ever_surgery, data=.) %>%
+  summary(., labelTranslations = list(symptom_count = 'Symptom count',
+                                   symptom_group = 'First symptom group',
+                                   ever_imaging = 'Ever had related imaging',
+                                   ever_surgery = 'Ever had related surgery'))
+```
+
+#### Date of first symptom
+
+```{r no_dx_covar_fig}
+ch2_final %>%
+  filter(never_dx=='Never Dx') %>%
+  ggplot(aes(x=as.Date(first_symptom_date)), data=.) +
+  geom_density() +
+  geom_vline(xintercept = as.Date('2019-11-01'), color='red') +
+  ylab('Count of Patients') +
+  xlab('Date of First Symptom') +
+  theme_bw()
+```
+The red line indicates the mean time to diagnosis for cases. Therefore, if we hypothesize that most of these patients are true cases who have yet to be diagnosed we might expect them to on average have a first symptom on or after the date of the red line. 
+
+#### {.unnumbered}
+
+### Censoring over time
+
+```{r censoring_over_time}
+ch2_final %>%
+  mutate(final_censor_type = ifelse(is.na(final_censor_type), 'Administratively censored', 
+                                    final_censor_type)) %>%
+  ggplot(aes(x=time_to_dx, fill = final_censor_type), data=.) +
+  geom_density() + 
+  facet_wrap(~final_censor_type) +
+  theme_bw()
+
+# look at death dates since there is a weird spike
+#sort(ch2_final$final_censor_date[which(ch2_final$final_censor_type == 'Death')])
+# they appear to span COVID and onward (potentially COVID related/as participants aged)
+```
+
+### False negative descriptives
+
+Summary of differences, compared to controls & cases, false negatives are/have: 
+
+- lowest HCU
+- youngest
+- highest HC use
+- most likely to be unpartnered
+- equal BMI to controls (lower than cases)
+- least likely to be FHC, most likely to be Staten Island/Westchester OP
+- most likely to have private insurance
+- most likely to be student
+- least likely to be Hispanic, most liikely to be NH White
+- least likely to speak Spanish
+
+```{r false_negatives, results='asis'}
+false_negatives_final <- false_negatives %>% filter(!ever_imaging & !ever_surgery)
+
+ch2_final %>%
+  mutate(false_negative_status = case_when(pat_id %in% false_negatives_final$pat_id~'False Negative',
+                                           grepl('Both|UF|Endo', final_outcome_status)~'Diagnosed',
+                                           TRUE~'Presumed True Negative')) %>%
+  mutate(false_negative_status = factor(false_negative_status, levels = c('False Negative', 
+                                                                          'Presumed True Negative', 'Case'))) %>%
+  tableby(false_negative_status~hcu_baseline + age_20160801 + HC_status + parity_binary + 
+                  marital_status_final + bmi_baseline + site_baseline + insur_status + 
+                  employ_simple_final + race_ethnic_final + language_eng_sp, data=.) %>%
+  summary(., labelTranslations = c(pat_labs, ses_labs))
+```
+
+### Patients with/without symptoms: patient characteristics
+
+Summary of findings, patients with symptoms have: 
+
+- higher HCU at baseline
+- higher HC use
+- higher proportion are unpartnered
+- more likely to be FHC, Nassau, NYU Brooklyn, Staten Island
+- higher proportion are public insurance
+- slightly higher unemployment
+- much more likely to be Hispanic, less likely to be NH White
+- higher proportion are Spanish-speakers
+
+```{r pat_symptoms, results='asis'}
+pat_w_covars %>% 
+  left_join(pat_symptom_status %>% select(pat_id, first_symptom), by='pat_id') %>%
+  mutate(has_symptoms = case_when(first_symptom~'Has symptoms', TRUE~'No symptoms')) %>%
+  tableby(has_symptoms~hcu_baseline + age_20160801 + HC_status + parity_binary + 
+                  marital_status_final + bmi_baseline + site_baseline + insur_status + 
+                  employ_simple_final + race_ethnic_final + language_eng_sp, data=.) %>%
+  summary(., labelTranslations = c(pat_labs, ses_labs))
+```
+
+These findings aren't super conclusive but suggests that more consistent NYULH patients are more likely to have symptoms reported, likely due to FHC there are higher proportions of Spanish-speakers and Latine patients in this group. 
+
+### Cases without symptoms: patient characteristics {.tabset}
+
+Overall it appears that FHC patients are more likely to have symptoms recorded -- this could speak to the quality of care at FHC or speak to continuity of care among FHC patients since FHC is their only care option. Which means symptoms reported are more likely to be recorded and linked to their EHR than patients that regularly change providers. This came with the normal suite of demographics we'd expect among FHC patients among cases with symptoms. 
+
+#### Uterine fibroids
+
+Summary of differences, cases with symptoms were/had: 
+
+- younger
+- more likely to use HC
+- more likely to go to FHC, less likely to go to Manhattan OP
+- more likely to use public insurance
+- more likely to be unemployed
+- more likely to be Hispanic, less likely to be NH White
+- more likely to speak Spanish
+
+```{r uf_case_symptoms, results='asis'}
+pat_w_covars %>% 
+  filter(pat_id %in% uf_cohort$pat_id[which(uf_cohort$confident_incident)]) %>%
+  mutate(has_symptoms = ifelse(pat_id %in% ch2_final$pat_id, TRUE, FALSE)) %>%
+  tableby(has_symptoms~hcu_baseline + age_20160801 + HC_status + parity_binary + 
+                  marital_status_final + bmi_baseline + site_baseline + insur_status + 
+                  employ_simple_final + race_ethnic_final + language_eng_sp, data=.) %>%
+  summary(., labelTranslations = c(pat_labs, ses_labs))
+```
+
+#### Endometriosis
+
+Summary of differences, cases with symptoms were/had: 
+
+- younger
+- more likely to use HC
+- more likely to be nulliparous
+- slightly more likely to be unpartnered
+- more likely to go to FHC, less likely to go to Manhattan OP
+- more likely to use public insurance
+- more likely to be unemployed
+- more likely to be Hispanic, less likely to be NH White
+- more likely to speak Spanish
+
+```{r endo_case_symptoms, results='asis'}
+pat_w_covars %>% 
+  filter(pat_id %in% endo_cohort$pat_id[which(endo_cohort$confident_incident)]) %>%
+  mutate(has_symptoms = ifelse(pat_id %in% ch2_final$pat_id, TRUE, FALSE)) %>%
+  tableby(has_symptoms~hcu_baseline + age_20160801 + HC_status + parity_binary + 
+                  marital_status_final + bmi_baseline + site_baseline + insur_status + 
+                  employ_simple_final + race_ethnic_final + language_eng_sp, data=.) %>%
+  summary(., labelTranslations = c(pat_labs, ses_labs))
+```
+
+####  {.unnumbered}
+
+### {.unnumbered}

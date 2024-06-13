@@ -1,0 +1,1035 @@
+---
+title: "Step 5: Chapter 1 Descriptives"
+author: "Mia Charifson"
+date: "2024-04-01"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+knitr::opts_knit$set(root.dir = '/Users/miacharifson/Library/CloudStorage/OneDrive-NYULangoneHealth/Charifson Dissertation/')
+
+library(DiagrammeR)
+library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+library(sf)
+library(tidycensus)
+library(readxl)
+library(rgdal)
+library(broom)
+library(dplyr)
+library(lubridate)
+library(arsenal)
+library(survival)
+library(survminer)
+library(tableone)
+```
+
+Last updated on: `r lubridate::today()`.
+
+# Chapter One
+
+This is an R Markdown document which documents the following: 
+ 
+(1) The final analytic and complete case sample size for Chapter 1 
+(2) Descriptive statistics for Chapter 1
+(3) Exploratory descriptive statistics
+
+```{r load_data}
+uf_cohort <- read.csv('Data/Derived/uf_all_hints.csv')
+endo_cohort <- read.csv('Data/Derived/endo_all_hints.csv')
+false_negatives <- read.csv('Data/Derived/putative_false_negatives.csv')
+covars <- read.csv('Data/Derived/clean_covariates.csv')
+pat_cohort <- read.csv('Data/Derived/pat_cohort_w_censoring.csv')
+address <- read.csv('Data/Derived/Chapter 1/pat_cohort_w_address.csv', 
+                    colClasses = c(census_tract_final = "character",
+                                   full_fips_tract_final = "character"))
+nyc_counties <- read_excel('Data/External/NY_NJ_PA_CT_county_fips.xlsx', 1)
+gent_index <- read_excel('Data/External/gentrification_index/NYC_Gentrification_2000_16.xlsx', 1)
+load("Data/External/ACS_ICE_RI_2016_2022_w_geography.RData")
+ttd_symptoms <- read.csv('Data/Derived/Chapter 2/pat_cohort_w_ttd.csv')
+pat_symptom_status <- read.csv('Data/Derived/Chapter 2/pat_cohort_symptom_status.csv')
+```
+
+```{r join_covars}
+pat_w_covars <- pat_cohort %>%
+  select(pat_id, index_enc_date, last_enc_date, all_provider_specialty, age_20160801, hcu_baseline, 
+         hcu_fu, site_baseline, site_fu, insur_status, insur_status_filled, obgyn_care_cohort) %>%
+  rename(index_provider_specialty = all_provider_specialty) %>%
+  left_join(covars %>% select(pat_id, employ_simple_final, race_final, ethnicity_final, race_ethnic_final,
+                              HC_status, parity_binary, language_eng_sp, marital_status_final, bmi_baseline),
+            by='pat_id')
+```
+
+```{r join_outcomes}
+pat_w_outcome <- pat_cohort %>%
+  select(pat_id) %>%
+  left_join(uf_cohort %>% select(pat_id, confident_incident, first_dx_date, first_confirm_date, 
+                                 first_confirm_type, first_confirm_name, first_location_date) %>%
+              rename_all(~paste0("uf_", .)), by=c('pat_id' = 'uf_pat_id')) %>%
+  left_join(endo_cohort %>% 
+              select(pat_id, confident_incident, first_dx_date, first_confirm_date, 
+                     first_confirm_type, first_confirm_name, first_location_date) %>%
+              rename_all(~paste0("endo_", .)), by=c('pat_id' = 'endo_pat_id')) %>%
+  left_join(address %>% 
+              select(pat_id, censor_address_date, censor_address_type) %>%
+              rename(final_censor_date = censor_address_date,
+                     final_censor_type = censor_address_type), by='pat_id') %>%
+  mutate(uf_dx = case_when(uf_confident_incident~TRUE, TRUE~FALSE),
+         endo_dx = case_when(endo_confident_incident~TRUE, TRUE~FALSE),
+         uf_first_dx_date = as.Date(uf_first_dx_date), endo_first_dx_date = as.Date(endo_first_dx_date), 
+         final_outcome_status = case_when((uf_dx & endo_dx) & 
+                                            uf_first_dx_date < endo_first_dx_date~'Both, UF first',
+                                          (uf_dx & endo_dx) & 
+                                            uf_first_dx_date > endo_first_dx_date~'Both, Endo first',
+                                          (uf_dx & endo_dx) & 
+                                            uf_first_dx_date == endo_first_dx_date~'Both, same day',
+                                          uf_dx & !endo_dx~'UF only',
+                                          !uf_dx & endo_dx~'Endo only',
+                                          !uf_dx & !endo_dx~'Control'),
+         first_outcome_dx_date = case_when(final_outcome_status %in% 
+                                             c('UF only', 'Both, UF first', 'Both, same day')~uf_first_dx_date,
+                                           final_outcome_status %in% 
+                                             c('Endo only', 'Both, Endo first')~endo_first_dx_date),
+         outcome_before_censor = case_when(final_outcome_status == 'Control'~NA,
+                                           first_outcome_dx_date <= final_censor_date~TRUE,
+                                           TRUE~FALSE),
+         final_censor_type_outcome = case_when(final_outcome_status != 'Control' & outcome_before_censor~'Case',
+                                               final_outcome_status %in% 
+                                                 c('UF only', 'Both, UF first', 'Both, same day') &
+                                                 final_censor_type==uf_first_confirm_type~'Case',
+                                               final_outcome_status %in% c('Endo only', 'Both, Endo first') &
+                                                 final_censor_type==endo_first_confirm_type~'Case',
+                                               TRUE~final_censor_type),
+         final_censor_date_outcome = case_when(final_censor_type_outcome=='Case'~first_outcome_dx_date,
+                                               TRUE~as.Date(final_censor_date))) %>%
+  select(-final_censor_date, -final_censor_type, -outcome_before_censor) %>%
+  rename(final_censor_date = final_censor_date_outcome, final_censor_type = final_censor_type_outcome)
+```
+
+```{r join_exposure}
+# reformat the nyc geo file to only 2017
+nyc_geo2017 <- nyc_metro_geo %>% 
+  filter(year==2017 & substr(GEOID, 1, 5) %in% nyc_counties$`State County fips`) %>%
+  select(-moe, -year) %>% 
+  spread(variable, estimate, sep = NULL) %>% 
+  mutate(
+    A = white150_200+white_above200,
+    P = black_less10+black10_15+black15_20+black20_25,
+    T = total_white_hh + total_black_hh,
+    ICE_RI = (A-P)/T)
+
+# subset the gentrification index file
+gent_index_sub <- gent_index %>% select(tractid, nta_name, score_0.5) %>%
+  mutate(GEOID = as.character(tractid)) %>%
+  rename(gent_index = score_0.5, NTAName = nta_name) %>%
+  select(-tractid)
+
+# join to the address data
+pat_w_exposure <- address %>%
+  select(-final_censor_date, -final_censor_type) %>%
+  mutate(GEOID=as.character(full_fips_tract_final)) %>%
+  left_join(gent_index_sub, by='GEOID') %>%
+  left_join(nyc_geo2017 %>% select(GEOID,NAME,ICE_RI), by='GEOID') %>%
+  separate(NAME, into = c(NA, "name"), sep = ", ") %>%
+  mutate(addr_NA_reason = ifelse(is.na(ICE_RI) & is.na(addr_NA_reason), 'ICE_RI missing', addr_NA_reason))
+```
+
+```{r check_FL_pts, include=FALSE}
+pat_w_covars %>%
+  select(pat_id, site_baseline, site_fu) %>%
+  filter(site_baseline == 'FLORIDA' | site_fu == 'FLORIDA') %>%
+  left_join(pat_w_exposure %>% select(pat_id, addr_NA_reason, censor_address_date, censor_address_type),
+            by='pat_id') %>%
+  arrange(site_baseline)
+```
+
+There are a subset of patients who start out in NYC, but their main site at start or during follow-up becomes Florida. Most of them are not censored as LTFU because they are still being seen getting relevant care added to NYU EHR. But if we account for address changes, they are censored at the date they left NYC. We will censor these patients on the date of change of address since their risk of diagnosis likely changes when they leave the greater NYC metro area. 
+
+## Final sample size
+
+```{r ch1_cohort}
+confident_prevalents <- rbind(uf_cohort %>% filter(confident_prevalent) %>% select(pat_id), 
+                              endo_cohort %>% filter(confident_prevalent) %>% select(pat_id)) %>%
+  distinct(pat_id)
+
+ch1_cohort <- pat_w_outcome %>%
+  filter(!pat_id %in% confident_prevalents$pat_id) %>%
+  left_join(pat_w_exposure %>% 
+              sf::st_drop_geometry(.) %>%
+              select(pat_id, addr_NA_reason), by='pat_id') %>%
+  left_join(pat_w_covars %>% select(pat_id, site_baseline), by='pat_id') %>%
+  # remove those who live outside NYC or have Florida for baseline site
+  filter(addr_NA_reason != 'Outside of NY-Newark CSA' | site_baseline != 'FLORIDA') %>%
+  mutate(included = case_when(!uf_confident_incident & 
+                                (!endo_confident_incident | is.na(endo_confident_incident))~'No',
+                              !endo_confident_incident & 
+                                (!uf_confident_incident | is.na(uf_confident_incident))~'No',
+                              !is.na(addr_NA_reason)~'No', 
+                              TRUE~'Yes'))
+```
+
+Chapter one eligibility includes:
+
+Additional eligibility exclusions: 
+
+- all identified confident prevalent cases are excluded
+- Not eligible (lived outside NYC, included Florida as baseline site)
+
+Reasons for exclusion from eligible cohort:
+
+- Outcome could not be ascertained (hesitant cases)
+- Missing exposure data (no address data, no baseline address, low accuracy, missing ICE)
+
+```{r ch1_cohort_Ns, eval=FALSE}
+# Eligible cohort
+ch1_cohort %>% distinct(pat_id) %>% nrow()
+# Outcome could not be ascertained
+ch1_cohort %>% 
+  # keep only confident cases or controls (not those with hesitant positives)
+  filter(uf_dx | endo_dx | (is.na(uf_confident_incident) & is.na(endo_confident_incident))) %>% 
+  distinct(pat_id) %>% nrow()
+# Has exposure data
+ch1_cohort %>% 
+  # keep only confident cases or controls (not those with hesitant positives)
+  filter(uf_dx | endo_dx | (is.na(uf_confident_incident) & is.na(endo_confident_incident))) %>% 
+  filter(is.na(addr_NA_reason)) %>%
+  distinct(pat_id) %>% nrow()
+# Is excluded due outcome status
+ch1_cohort %>% filter(!uf_confident_incident & !endo_confident_incident) %>% distinct(pat_id) %>% nrow()
+# Is excluded due to exposure data
+length(which(!is.na(ch1_cohort$addr_NA_reason) | ch1_cohort$site_baseline == 'FLORIDA'))
+```
+
+```{r flowchart}
+### Need to figure out how to make off shoots for excluded cases
+### draw line from an edge to a node
+DiagrammeR::grViz("digraph {
+  graph [layout = dot, rankdir = TB]
+  
+  node [shape = rectangle]        
+  rec1 [label = 'Eligible Cohort (n=74,395)']
+  rec2 [label = 'Complete Outcome Data (n=73,481)']
+  rec3 [label =  'Complete Exposure Data (n=71,243)']
+  rec4 [label = 'Final sample size (n=71,243)']
+  rec5 [label = 'Excluded Patients (n=3,152)']
+  rec6 [label = 'Outcome status could \n not be ascertained (n=914)']
+  rec7 [label = 'Missing exposure data (n=2,276)']
+  # edge definitions with the node IDs
+  rec1 -> rec2 -> rec3 -> rec4
+  rec5 -> rec6 -> rec7
+  }",
+  height = 500)
+```
+
+```{r all_data}
+all_data <- ch1_cohort %>% 
+  left_join(pat_w_covars %>% select(-site_baseline), by='pat_id') %>%
+  left_join(pat_w_exposure %>% select(-geometry, -addr_NA_reason), by='pat_id') %>%
+  left_join(pat_symptom_status %>% rename(symptom_time_group = time_group), by='pat_id') %>%
+  left_join(ttd_symptoms %>% select(pat_id, ttd, first_symptom_date, first_symptom_icd10s, first_symptom_dx_name), by='pat_id') %>%
+  mutate(ICE_quartile = ntile(ICE_RI, 4),
+         ICE_quartile = factor(ICE_quartile, labels=c('Q1', 'Q2', 'Q3', 'Q4'))) %>%
+  mutate(uf_person_years = case_when(is.na(final_censor_date)~
+                                    difftime(last_enc_date, index_enc_date,units='days'),
+                                  TRUE~difftime(final_censor_date,index_enc_date,units='days')),
+         uf_person_years = as.numeric(uf_person_years)/365.25,
+         uf_binary = ifelse(uf_dx, 1, 0)) %>%
+  mutate(endo_person_years = case_when(is.na(final_censor_date)~
+                                    difftime(last_enc_date, index_enc_date,units='days'),
+                                  TRUE~difftime(final_censor_date,index_enc_date,units='days')),
+         endo_person_years = as.numeric(endo_person_years)/365.25,
+         endo_binary = ifelse(endo_dx, 1, 0))
+
+write.csv(all_data, 'Data/Derived/all_data_noImpute_20240613.csv', row.names = FALSE)
+```
+
+
+```{r subset_data}
+# main analysis will include confident positives & controls
+ch1_final <- all_data %>% 
+  left_join(pat_w_exposure %>% select(pat_id, geometry), by='pat_id') %>%
+  filter(included=='Yes') %>%
+  select(-contains('symptom'), -ttd)
+
+ch1_sample <- ch1_cohort %>% 
+  left_join(pat_cohort %>% select(pat_id, obgyn_care_cohort), by='pat_id') %>%
+  mutate(ch1_main = ifelse(included=='Yes', TRUE, FALSE),
+         ch1_obgyn_cohort = ifelse(included=='Yes' & obgyn_care_cohort, TRUE, FALSE),
+         ch1_all_cases = ifelse(is.na(addr_NA_reason), TRUE, FALSE)) %>%
+  select(pat_id, contains('ch1'))
+
+write.csv(ch1_final, 'Data/Derived/Chapter 1/final_dataset_20240514.csv', row.names = FALSE)
+write.csv(ch1_final, 'Data/Derived/Chapter 1/sample_flags_20240529.csv', row.names = FALSE)
+```
+
+```{r censor_group}
+# look at death dates since there is a weird spike
+#sort(ch1_final$final_censor_date[which(ch1_final$final_censor_type == 'Death')])
+# they appear to span COVID and onward (potentially COVID related/as participants aged)
+
+ch1_final %>%
+  mutate(final_censor_type = ifelse(is.na(final_censor_type), 'Administratively censored', final_censor_type)) %>%
+  CreateTableOne(data=., var='final_censor_type')
+```
+
+
+## Descriptive statistics {.tabset}
+
+### Outcome: Incident disease {.tabset}
+
+Explore the incidence of UF and Endo in the cohort. If patients have both, they are counted in each case group but they are censored for person time according to the first condition they are diagnosed with. 
+
+QUESTION: Should this be only the case they were first diagnosed with? And if they were diagnosed with both then include in both?
+
+#### UF Case Incidence
+
+```{r uf_incidence}
+ch1_final %>%
+  summarise(total_uf_person_time = sum(uf_person_years),
+            n_cases = sum(grepl('UF|Both', final_outcome_status), na.rm=TRUE),
+            uf_incidence_rate = n_cases/sum(uf_person_years)*10000)
+```
+
+```{r uf_hazard}
+surv_uf <- survfit(Surv(uf_person_years*12, uf_binary) ~ 1, data = ch1_final)
+ggsurvplot(surv_uf, fun = function(y) -log(y)) +
+  xlab('Person-time (months)') +
+  ylab('Cumulative Hazards of UF Diagnosis')
+```
+
+
+#### Endo Case Incidence
+
+```{r endo_incidence}
+ch1_final %>%
+    summarise(total_endo_person_time = sum(endo_person_years),
+            n_cases = sum(grepl('Endo|Both', final_outcome_status), na.rm=TRUE),
+            endo_incidence_rate = n_cases/sum(endo_person_years)*10000)
+```
+```{r endo_survival}
+surv_endo <- survfit(Surv(endo_person_years*12, endo_binary) ~ 1, data = ch1_final)
+ggsurvplot(surv_endo, fun = function(y) -log(y)) +
+  xlab('Person-time (months)') +
+  ylab('Cumulative Hazards of Endo Diagnosis')
+```
+
+
+#### {.unnumbered}
+
+### Exposure: ICE-RI {.tabset}
+
+#### State & County (NYC vs not NYC)
+
+```{r geo_table}
+ch1_final <- ch1_final %>%
+  rename(county_name = name) %>%
+  mutate(state = case_when(substr(full_fips_tract_final, 1, 2)=='36'~'NY',
+                           substr(full_fips_tract_final, 1, 2)=='34'~'NJ',
+                           substr(full_fips_tract_final, 1, 2)=='09'~'CT',
+                           substr(full_fips_tract_final, 1, 2)=='42'~'PA'),
+         nyc_borough = case_when(county_name %in% c('New York County', 'Kings County',
+                                              'Bronx County', 'Queens County',
+                                              'Richmond County')~TRUE,
+                                   TRUE~FALSE))
+
+CreateTableOne(data=ch1_final, vars=c('state', 'nyc_borough'))
+```
+Among patients who live in the NYC boroughs:
+```{r nyc_boroughs}
+CreateTableOne(data=ch1_final %>% filter(nyc_borough), vars=c('county_name'))
+```
+#### Mapping Distribution of Cohort
+
+```{r cohort_distribution, out.width='100%'}
+# join all together
+df_tract <- nyc_geo2017 %>%
+  left_join(address %>%
+              filter(pat_id %in% ch1_final$pat_id) %>% 
+              group_by(full_fips_tract_final) %>%
+              summarise(count=n(), .groups='drop') %>%
+              mutate(GEOID=as.character(full_fips_tract_final)), 
+            by='GEOID') %>% 
+  separate(NAME, into = c(NA, "name"), sep = ", ") %>%
+  left_join(gent_index_sub, by='GEOID') 
+
+p1 <- df_tract %>%
+  ggplot() +
+  geom_sf(aes(fill = count)) +
+  coord_sf(crs = st_crs(df_tract), datum = NA) + 
+  scale_fill_viridis_c(na.value="white", option='mako', direction=-1) +
+  labs(subtitle =  "Greater NYC Metro Area") +
+  theme_void()
+
+p2 <- df_tract %>%
+  filter(grepl('Bronx|Kings|Richmond|Queens|New York', name)) %>%
+  ggplot() + 
+  geom_sf(aes(fill = count)) +
+  coord_sf(crs = st_crs(df_tract), datum = NA) + 
+  scale_fill_viridis_c(na.value="white", option='mako', direction=-1) +
+  labs(subtitle = "NYC Boroughs") +
+  theme_void()
+
+ggarrange(p1, p2, nrow=1, common.legend = TRUE, legend = 'bottom', widths = c(1, 0.75))
+```
+
+#### Mapping Distribution of Cases {.tabset}
+
+##### Uterine fibroids
+
+```{r case_distribution_uf, out.width='100%'}
+# join all together
+df_tract_cases <- nyc_geo2017 %>%
+  left_join(ch1_final %>%
+              group_by(full_fips_tract_final) %>%
+              summarise(uf_count=sum(uf_dx), endo_count=sum(uf_dx), .groups='drop') %>%
+              mutate(GEOID=as.character(full_fips_tract_final)), 
+            by='GEOID') %>% 
+  separate(NAME, into = c(NA, "name"), sep = ", ")
+
+p1 <- df_tract_cases %>%
+  ggplot() +
+  geom_sf(aes(fill = uf_count)) +
+  coord_sf(crs = st_crs(df_tract_cases), datum = NA) + 
+  scale_fill_viridis_c(na.value="white", option='rocket', direction=-1) +
+  labs(subtitle =  "Greater NYC Metro") +
+  theme_void()
+
+p2 <- df_tract_cases %>%
+  filter(grepl('Bronx|Kings|Richmond|Queens|New York', name)) %>%
+  ggplot() + 
+  geom_sf(aes(fill = uf_count)) +
+  coord_sf(crs = st_crs(df_tract_cases), datum = NA) + 
+  scale_fill_viridis_c(na.value="white", option='rocket', direction=-1) +
+  labs(subtitle = "NYC Boroughs") +
+  theme_void()
+
+ggarrange(p1, p2, nrow=1, common.legend = TRUE, legend = 'bottom', widths = c(1, 0.75))
+```
+
+##### Endometriosis
+
+```{r case_distribution_endo, out.width='100%'}
+p1 <- df_tract_cases %>%
+  ggplot() +
+  geom_sf(aes(fill = endo_count)) +
+  coord_sf(crs = st_crs(df_tract_cases), datum = NA) + 
+  scale_fill_viridis_c(na.value="white", option='plasma', direction=-1) +
+  labs(subtitle =  "Greater NYC Metro") +
+  theme_void()
+
+p2 <- df_tract_cases %>%
+  filter(grepl('Bronx|Kings|Richmond|Queens|New York', name)) %>%
+  ggplot() + 
+  geom_sf(aes(fill = endo_count)) +
+  coord_sf(crs = st_crs(df_tract_cases), datum = NA) + 
+  scale_fill_viridis_c(na.value="white", option='plasma', direction=-1) +
+  labs(subtitle = "NYC Boroughs") +
+  theme_void()
+
+ggarrange(p1, p2, nrow=1, common.legend = TRUE, legend = 'bottom', widths = c(1, 0.75))
+```
+
+##### {.unnumbered}
+
+#### Mapping Distribution of ICE-RI
+
+```{r ice_distribution, out.width='100%'}
+p1 <- nyc_geo2017 %>%
+  ggplot() +
+  geom_sf(aes(fill = ICE_RI)) +
+  coord_sf(crs = st_crs(nyc_geo2017), datum = NA) + 
+  scale_fill_gradient2(na.value="white", low='darkgreen', mid='#F7FF8B', high='#7324CE') +
+  labs(subtitle =  "Greater NYC Metro") +
+  theme_void()
+
+p2 <- nyc_geo2017 %>%
+  separate(NAME, into = c(NA, "name"), sep = ", ") %>% 
+  filter(grepl('Bronx|Kings|Richmond|Queens|New York', name)) %>%
+  ggplot() + 
+  geom_sf(aes(fill = ICE_RI)) +
+  coord_sf(crs = st_crs(nyc_geo2017), datum = NA) + 
+  scale_fill_gradient2(na.value="white", low='darkgreen', mid='#F7FF8B', high='#7324CE') +
+  labs(subtitle = "NYC Boroughs") +
+  theme_void()
+
+ggarrange(p1, p2, nrow=1, common.legend = TRUE, legend = 'bottom', widths = c(1, 0.75))
+```
+
+#### ICE Race-Income Distribution by Case
+
+```{r ice_boxplot}
+p1 <- ggplot(data=ch1_final, aes(y=ICE_RI)) +
+  geom_histogram(bins = 30, color='white') + 
+  labs(subtitle =  "Overall") +
+  ylab('ICE (race+income)') +
+  theme_bw()
+
+p2 <- ch1_final %>%
+  mutate(final_outcome_group = case_when(grepl('Both', final_outcome_status)~'Both',
+                                         TRUE~final_outcome_status)) %>%
+  ggplot(data=., aes(y=ICE_RI, x=final_outcome_group, fill=final_outcome_group)) +
+  geom_boxplot() + 
+  labs(subtitle =  "By Outcome Status") +
+  xlab('Outcome Group') +
+  ylab('ICE (race+income)') +
+  theme_bw()
+
+ggarrange(p1, p2, nrow=1, common.legend = TRUE, legend = 'bottom')
+```
+
+#### {.unnumbered}
+
+
+### Table 1: Cohort characteristics 
+
+```{r table1_pat, results='asis'}
+pat_labs <- list(hcu_baseline='Healthcare utilization (visits/baseline year)',
+                 age_20160801='Age (years)',
+                 HC_status='Hormonal contraceptive use',
+                 parity_binary='Parity status',
+                 marital_status_final='Relationship status',
+                 bmi_baseline='Body mass index (kg/m^2)')
+
+# patient information
+summary(tableby(~hcu_baseline+age_20160801+HC_status+parity_binary+marital_status_final+bmi_baseline,
+                data=ch1_final), labelTranslations = pat_labs)
+```
+
+```{r table1_ses, results='asis'}
+ses_labs <- list(site_baseline='Most common care site (baseline)',
+                 insur_status='Insurance type',
+                 employ_simple_final='Employment status',
+                 race_ethnic_final='Racial and Ethnic Group',
+                 language_eng_sp='Preferred language')
+
+# ses information
+summary(tableby(~site_baseline+insur_status+employ_simple_final+race_ethnic_final+language_eng_sp,
+                data=ch1_final), labelTranslations = ses_labs)
+```
+
+## Bivariate statistics {.tabset}
+
+### Exposure-Outcome {.tabset}
+
+- ICE-RI Continuously
+- Grouped into quartiles of ICE
+- Survival curves
+
+#### Uterine fibroids
+
+```{r uf_exp_tab, results='asis'}
+ice_labs <- list(ICE_RI = 'ICE race-income score', 
+                 ICE_quartile = 'ICE race-income quartile')
+
+ch1_final %>%
+  tableby(uf_dx~ICE_quartile + ICE_RI, data=.) %>%
+  summary(., labelTranslations = ice_labs)
+```
+
+```{r uf_exp_survival}
+mod_uf <- survfit(Surv(uf_person_years*12, uf_binary) ~ ICE_quartile, data = ch1_final)
+ggsurvplot(mod_uf, fun=function(y)-log(y)) +
+  xlab('Person-time (months)') +
+  ylab('Cumulative Hazards of UF Diagnosis')
+```
+
+```{r uf_exp_survival_race, eval=FALSE}
+mod_uf_black <- survfit(Surv(uf_person_years*12, uf_binary) ~ ICE_quartile, 
+                        data = ch1_final %>% filter(race_ethnic_final == 'NH Black/African American'))
+ggsurvplot(mod_uf_black, fun=function(y)-log(y)) +
+  xlab('Person-time (months)') +
+  ylab('Cumulative Hazards of UF Diagnosis')
+
+mod_uf_white <- survfit(Surv(uf_person_years*12, uf_binary) ~ ICE_quartile, 
+                        data = ch1_final %>% filter(race_ethnic_final == 'NH White'))
+ggsurvplot(mod_uf_white, fun=function(y)-log(y)) +
+  xlab('Person-time (months)') +
+  ylab('Cumulative Hazards of UF Diagnosis')
+
+mod_uf_latina <- survfit(Surv(uf_person_years*12, uf_binary) ~ ICE_quartile, 
+                        data = ch1_final %>% filter(race_ethnic_final == 'Hispanic/Latino'))
+ggsurvplot(mod_uf_latina, fun=function(y)-log(y)) +
+  xlab('Person-time (months)') +
+  ylab('Cumulative Hazards of UF Diagnosis')
+```
+
+#### Endometriosis
+
+```{r endo_exp_tab, results='asis'}
+ch1_final %>%
+  tableby(endo_dx~ICE_quartile + ICE_RI, data=.) %>%
+  summary(., labelTranslations = ice_labs)
+```
+
+```{r endo_exp_survival}
+mod_endo <- survfit(Surv(endo_person_years*12, endo_binary) ~ ICE_quartile, data = ch1_final)
+ggsurvplot(mod_endo, fun=function(y)-log(y)) +
+  xlab('Person-time (months)') +
+  ylab('Cumulative Hazards of UF Diagnosis')
+```
+
+```{r endo_exp_survival_race, eval=FALSE}
+mod_endo_black <- survfit(Surv(endo_person_years*12, endo_binary) ~ ICE_quartile, 
+                        data = ch1_final %>% filter(race_ethnic_final == 'NH Black/African American'))
+ggsurvplot(mod_endo_black, fun=function(y)-log(y)) +
+  xlab('Person-time (months)') +
+  ylab('Cumulative Hazards of UF Diagnosis')
+
+mod_endo_white <- survfit(Surv(endo_person_years*12, endo_binary) ~ ICE_quartile, 
+                        data = ch1_final %>% filter(race_ethnic_final == 'NH White'))
+ggsurvplot(mod_endo_white, fun=function(y)-log(y)) +
+  xlab('Person-time (months)') +
+  ylab('Cumulative Hazards of UF Diagnosis')
+
+mod_endo_latina <- survfit(Surv(endo_person_years*12, endo_binary) ~ ICE_quartile, 
+                        data = ch1_final %>% filter(race_ethnic_final == 'Hispanic/Latino'))
+ggsurvplot(mod_endo_latina, fun=function(y)-log(y)) +
+  xlab('Person-time (months)') +
+  ylab('Cumulative Hazards of UF Diagnosis')
+```
+
+#### {.unnumbered}
+
+### Exposure-Covariates
+
+Summary of observations -- patients in the highest quartile are:
+
+- the lowest HCU at baseline
+- more likely to be nulliparous
+- more likely to be partnered
+- the lowest BMI at baseline
+- most likely to be at Nassau/Manhattan OP and least likely to be at FHC
+- most likely to be privately insured
+- most likely to be fully employed
+- most likely to be NH White
+- most likely to be English speaker 
+
+```{r exp_covar_pat, results='asis'}
+# patient information
+summary(tableby(ICE_quartile~hcu_baseline+age_20160801+HC_status+parity_binary+marital_status_final+bmi_baseline,
+                data=ch1_final), labelTranslations = pat_labs)
+```
+
+```{r exp_covar_ses, results='asis'}
+# ses information
+summary(tableby(ICE_quartile~site_baseline+insur_status+employ_simple_final+race_ethnic_final+language_eng_sp,
+                data=ch1_final), labelTranslations = ses_labs)
+```
+
+### Covariates-Outcome {.tabset}
+
+#### Uterine fibroids
+
+Summary of observations -- patients with fibroids are:
+
+- higher HCU
+- older
+- less likely to be using HC at baseline
+- more likely to be parous 
+- slightly more likely to be partnered
+- higher BMI
+- less likely to be at Nassau OP and Westchester OP, more likely to be at FHC
+- more likely to be publically insured
+- more likely to be employed, less likely to be a student
+- much more likely to be NH Black and more likely to be Hispanic, 
+less likely to be NH White
+- slightly more likely to be a Spanish speaker
+
+```{r uf_covar_pat, results='asis'}
+# patient information
+summary(tableby(uf_dx~hcu_baseline+age_20160801+HC_status+parity_binary+marital_status_final+bmi_baseline,
+                data=ch1_final), labelTranslations = pat_labs)
+```
+
+```{r uf_covar_ses, results='asis'}
+# ses information
+summary(tableby(uf_dx~site_baseline+insur_status+employ_simple_final+race_ethnic_final+language_eng_sp,
+                data=ch1_final), labelTranslations = ses_labs)
+```
+
+#### Endometriosis
+
+Summary of observations -- patients with endometriosis are:
+
+- least HCU at baseline
+- older
+- slightly less likely to use HC
+- more likely to be nulliparous
+- slightly less likely to be partnered
+- slightly higher BMI at baseline
+- most likely to be at Manhattan/Westchester OP and less likely to be at Nassau OP/FHC
+- most likely to be fully employed
+- more likely to be NH Black, Hispanic and less likely to be NH White
+- slightly more likely to be English speaker 
+
+```{r endo_covar_pat, results='asis'}
+# patient information
+summary(tableby(endo_dx~hcu_baseline+age_20160801+HC_status+parity_binary+marital_status_final+bmi_baseline,
+                data=ch1_final), labelTranslations = pat_labs)
+```
+
+```{r endo_covar_ses, results='asis'}
+# ses information
+summary(tableby(endo_dx~site_baseline+insur_status+employ_simple_final+race_ethnic_final+language_eng_sp,
+                data=ch1_final), labelTranslations = ses_labs)
+```
+
+#### {.unnumbered}
+
+### LTFU vs. not LTFU
+
+Summary of observations -- patients who are LTFU are/have:
+
+- lower HCU at baseline
+- younger
+- more likely to use HC 
+- more likely to be unpartnered
+- lower BMI
+- less likely to be at FHC, Nassau OP, Queens OP, more likely to be at Manhattan/Westchester OP
+- slightly more likely to be privately insured
+- more likely to be students
+- more likely to be NH White
+- more likely to be an English speaker
+
+```{r ltfu_covar_pat, results='asis'}
+ch1_final <- ch1_final %>% mutate(ltfu = case_when(final_censor_type == 'LTFU'~TRUE, 
+                                                   TRUE~FALSE))
+# patient information
+summary(tableby(ltfu~hcu_baseline+age_20160801+HC_status+parity_binary+marital_status_final+bmi_baseline,
+                data=ch1_final), labelTranslations = pat_labs)
+```
+
+```{r ltfu_covar_ses, results='asis'}
+# ses information
+summary(tableby(ltfu~site_baseline+insur_status+employ_simple_final+race_ethnic_final+language_eng_sp,
+                data=ch1_final), labelTranslations = ses_labs)
+```
+
+### {.unnumbered}
+
+## Exploratory descriptive statistics {.tabset}
+### Table 1 for OBGYN care cohort
+
+Summary of differences with larger cohort, the OBGYN cohort has/is:
+
+- higher HCU at baseline
+- younger
+- higher HC use
+- lower BMI
+- less likely to be at Tisch/Brooklyn/FHC/Queens/Westecher OP, more likely to be Nassau/Staten Island OP
+- more likely to be privately insured
+- less likely to be students
+- less likely to be Hispanic/NH Asian/NH Black, more likely to be NH White
+- slightly higher Spanish/English speakers and less Other language speakers
+
+```{r obgyn_tab1, results='asis'}
+# patient information
+summary(tableby(obgyn_care_cohort~hcu_baseline+age_20160801+HC_status+parity_binary+
+                  marital_status_final+bmi_baseline +site_baseline+insur_status+
+                  employ_simple_final+ race_ethnic_final+language_eng_sp, data=ch1_final), 
+        labelTranslations = c(pat_labs, ses_labs))
+```
+
+UF incidence for the OBGYN cohort:
+```{r obgyn_uf_incidence}
+ch1_final %>%
+  filter(obgyn_care_cohort) %>%
+  summarise(total_uf_person_time = sum(uf_person_years),
+            n_cases = sum(grepl('UF|Both', final_outcome_status), na.rm=TRUE),
+            uf_incidence_rate = n_cases/total_uf_person_time*10000)
+```
+
+Endo incidence for the OBGYN cohort:
+```{r obgyn_endo_incidence}
+ch1_final %>%
+  filter(obgyn_care_cohort) %>%
+  summarise(total_endo_person_time = sum(endo_person_years),
+            n_cases = sum(grepl('Endo|Both', final_outcome_status), na.rm=TRUE),
+            endo_incidence_rate = n_cases/total_endo_person_time*10000)
+```
+
+### Cohort with all cases included {.tabset}
+
+#### Table 1: Patient characteristics
+
+There are no notable differences between the all cases cohort and the confident cases cohort. 
+
+```{r all_cases_tab1, results='asis'}
+ch1_all_cases <- ch1_cohort %>% 
+  filter(is.na(addr_NA_reason)) %>%
+  left_join(pat_w_covars %>% select(-site_baseline), by='pat_id') %>%
+  left_join(pat_w_exposure %>% select(-addr_NA_reason), by='pat_id') %>%
+  mutate(ICE_quartile = ntile(ICE_RI, 4),
+         ICE_quartile = factor(ICE_quartile, labels=c('Q1', 'Q2', 'Q3', 'Q4'))) %>%
+  mutate(uf_person_years = case_when(is.na(final_censor_date)~
+                                    difftime(last_enc_date, index_enc_date,units='days'),
+                                  TRUE~difftime(final_censor_date,index_enc_date,units='days')),
+         uf_person_years = as.numeric(uf_person_years)/365.25,
+         uf_binary = ifelse(uf_dx, 1, 0)) %>%
+  mutate(endo_person_years = case_when(is.na(final_censor_date)~
+                                    difftime(last_enc_date, index_enc_date,units='days'),
+                                  TRUE~difftime(final_censor_date,index_enc_date,units='days')),
+         endo_person_years = as.numeric(endo_person_years)/365.25,
+         endo_binary = ifelse(endo_dx, 1, 0))
+
+# patient information
+summary(tableby(~hcu_baseline + age_20160801 + HC_status + parity_binary + 
+                  marital_status_final + bmi_baseline + site_baseline + insur_status + 
+                  employ_simple_final + race_ethnic_final + language_eng_sp, 
+                data=ch1_all_cases), labelTranslations = c(pat_labs, ses_labs))
+```
+
+#### Uterine fibroids: hesitant vs. confident cases
+
+Overall, confident cases are more represented in FHC likely related to continous care -- they are also more diverse related to this finding. Summary of differences between hesitant and confident cases, confident cases have/are: 
+
+- higher HCU at baseline
+- higher HC use
+- higher nulliparity
+- less likely to be partnered
+- more likely to be FHC, less likely to be at Nassau, Queens, Westchester OP
+- more likely to have public insurance
+- more likely to be unemployed
+- more likely to be Hispanic and NH Asian, less likely to be NH Black & White
+- more likely to speak Spanish
+
+```{r uf_case_compare, results='asis'}
+summary(tableby(uf_confident_incident~hcu_baseline + age_20160801 + HC_status + parity_binary + 
+                  marital_status_final + bmi_baseline + site_baseline + insur_status + 
+                  employ_simple_final + race_ethnic_final + language_eng_sp, 
+                data=ch1_all_cases), labelTranslations = c(pat_labs, ses_labs))
+```
+
+#### Endometriosis: hesitant vs. confident cases
+
+Overall, confident cases are more represented in FHC likely related to continous care -- they are also more diverse related to this finding. Summary of differences between hesitant and confident cases, confident cases have/are: 
+
+- higher HCU at baseline
+- higher HC use
+- higher parity
+- more likely to be FHC, less likely to be at Queens, Westchester OP
+- more likely to be unemployed
+- more likely to be Hispanic and NH Asian, less likely to be NH Black & White
+- more likely to speak Spanish
+
+```{r endo_case_compare, results='asis'}
+summary(tableby(endo_confident_incident~hcu_baseline + age_20160801 + HC_status + parity_binary + 
+                  marital_status_final + bmi_baseline + site_baseline + insur_status + 
+                  employ_simple_final + race_ethnic_final + language_eng_sp, 
+                data=ch1_all_cases), labelTranslations = c(pat_labs, ses_labs))
+```
+
+#### {.unnumbered}
+
+### False negative descriptives
+
+Summary of differences, compared to controls & cases, false negatives are/have: 
+
+- lowest HCU
+- youngest
+- most likely to use HC
+- least likely to be parous
+- most likely to be unpartnered
+- lowest BMI
+- most likely to be at Nassau/Staten Island/Westchester OP
+- most likely to be privately insured
+- most likely to be students
+- most likely to be White
+- least likely to speak Spanish
+
+```{r false_negatives, results='asis'}
+false_negatives_final <- false_negatives %>% filter(!ever_imaging & !ever_surgery)
+
+ch1_final %>%
+  mutate(false_negative_status = case_when(pat_id %in% false_negatives_final$pat_id~'False Negative',
+                                           grepl('Both|UF|Endo', final_outcome_status)~'Case',
+                                           TRUE~final_outcome_status)) %>%
+  mutate(false_negative_status = factor(false_negative_status, levels = c('False Negative', 'Control', 'Case'))) %>%
+  tableby(false_negative_status~hcu_baseline + age_20160801 + HC_status + parity_binary + 
+                  marital_status_final + bmi_baseline + site_baseline + insur_status + 
+                  employ_simple_final + race_ethnic_final + language_eng_sp, data=.) %>%
+  summary(., labelTranslations = c(pat_labs, ses_labs))
+```
+
+### Diagnostic methods {.tabset}
+
+#### By case status {.tabset}
+
+##### Uterine fibroids
+
+Most likely to be first diagnosed via ultrasound.
+
+```{r uf_dx_method}
+uf_cohort %>%
+  filter(pat_id %in% ch1_final$pat_id & confident_incident) %>%
+  mutate(ultrasound = ifelse(grepl('US|ultra', first_confirm_name), TRUE, FALSE),
+         mri = ifelse(grepl('MRI|magnetic', first_confirm_name), TRUE, FALSE),
+         ct = ifelse(grepl('CT|computed', first_confirm_name), TRUE, FALSE),
+         hysterectomy = ifelse(grepl('HYSTERECTOMY', first_confirm_name), TRUE, FALSE),
+         myomectomy = ifelse(grepl('MYOMECTOMY', first_confirm_name), TRUE, FALSE),
+         oophorectomy = ifelse(grepl('OOPHORECTOMY', first_confirm_name), TRUE, FALSE),
+         salpingectomy = ifelse(grepl('SALPINGECTOMY', first_confirm_name), TRUE, FALSE),
+         hysteroscopy = ifelse(grepl('HYSTEROSCOPY', first_confirm_name), TRUE, FALSE)) %>%
+  CreateTableOne(data=., vars=c('ultrasound', 'mri', 'ct', 'hysterectomy',
+                                'myomectomy', 'oophorectomy', 'salpingectomy', 'hysteroscopy'))
+```
+
+##### Endometriosis
+
+Most likely to be first diagnosed via ultrasound, then MRI.
+
+```{r endo_dx_method}
+endo_cohort %>%
+  filter(pat_id %in% ch1_final$pat_id & confident_incident) %>%
+  mutate(ultrasound = ifelse(grepl('US|ultra', first_confirm_name), TRUE, FALSE),
+         mri = ifelse(grepl('MRI|magnetic', first_confirm_name), TRUE, FALSE),
+         ct = ifelse(grepl('CT|computed', first_confirm_name), TRUE, FALSE),
+         hysterectomy = ifelse(grepl('HYSTERECTOMY', first_confirm_name), TRUE, FALSE),
+         myomectomy = ifelse(grepl('MYOMECTOMY', first_confirm_name), TRUE, FALSE),
+         oophorectomy = ifelse(grepl('OOPHORECTOMY', first_confirm_name), TRUE, FALSE),
+         salpingectomy = ifelse(grepl('SALPINGECTOMY', first_confirm_name), TRUE, FALSE),
+         hysteroscopy = ifelse(grepl('HYSTEROSCOPY', first_confirm_name), TRUE, FALSE)) %>%
+  CreateTableOne(data=., vars=c('ultrasound', 'mri', 'ct', 'hysterectomy',
+                                'myomectomy', 'oophorectomy', 'salpingectomy', 'hysteroscopy'))
+```
+
+##### {.unnumbered}
+
+#### By location of care {.tabset}
+
+##### Uterine fibroids
+
+Observations:
+
+- Highest rate of US diagnosis was Nassau OP and FHC (US was highest across all sites). Lowest was Westchester OP. 
+- Highest rate of MRI diagnosis was Manhattan OP then Westchester OP. Lowest was FHC/NYU Langone Brooklyn. 
+- Highest rate of CT diagnosis was NYU Brooklyn then Tisch/Manhatatn IP. Lowest was Staten Island OP.
+
+```{r uf_site_dx_method}
+uf_cohort %>%
+  inner_join(ch1_final %>% select(pat_id, site_baseline), by='pat_id') %>%
+  filter(confident_incident) %>%
+  mutate(ultrasound = ifelse(grepl('US|ultra', first_confirm_name), TRUE, FALSE),
+         mri = ifelse(grepl('MRI|magnetic', first_confirm_name), TRUE, FALSE),
+         ct = ifelse(grepl('CT|computed', first_confirm_name), TRUE, FALSE),
+         hysterectomy = ifelse(grepl('HYSTERECTOMY', first_confirm_name), TRUE, FALSE),
+         myomectomy = ifelse(grepl('MYOMECTOMY', first_confirm_name), TRUE, FALSE),
+         oophorectomy = ifelse(grepl('OOPHORECTOMY', first_confirm_name), TRUE, FALSE),
+         salpingectomy = ifelse(grepl('SALPINGECTOMY', first_confirm_name), TRUE, FALSE),
+         hysteroscopy = ifelse(grepl('HYSTEROSCOPY', first_confirm_name), TRUE, FALSE)) %>%
+  CreateTableOne(data=., vars=c('ultrasound', 'mri', 'ct', 'hysterectomy',
+                                'myomectomy', 'oophorectomy', 'salpingectomy', 'hysteroscopy'),
+                 strata='site_baseline')
+```
+
+##### Endometriosis
+
+Observations (ignoring Westchester since they only had n=1):
+
+- Highest rate of US diagnosis was FHC (US was highest across all sites). Lowest was Tisch/Manhattan IP.
+- Highest rate of MRI diagnosis was Manhattan OP, Queens OP, and Tisch/Manhattan IP. Lowest was FHC/NYU Langone Brooklyn.
+- Highest rate of CT diagnosis was Tisch/Manhattan IP then NYU Brooklyn. Lowest was Staten Island OP.
+
+```{r endo_site_dx_method}
+endo_cohort %>%
+  inner_join(ch1_final %>% select(pat_id, site_baseline), by='pat_id') %>%
+  filter(confident_incident) %>%
+  mutate(ultrasound = ifelse(grepl('US|ultra', first_confirm_name), TRUE, FALSE),
+         mri = ifelse(grepl('MRI|magnetic', first_confirm_name), TRUE, FALSE),
+         ct = ifelse(grepl('CT|computed', first_confirm_name), TRUE, FALSE),
+         hysterectomy = ifelse(grepl('HYSTERECTOMY', first_confirm_name), TRUE, FALSE),
+         myomectomy = ifelse(grepl('MYOMECTOMY', first_confirm_name), TRUE, FALSE),
+         oophorectomy = ifelse(grepl('OOPHORECTOMY', first_confirm_name), TRUE, FALSE),
+         salpingectomy = ifelse(grepl('SALPINGECTOMY', first_confirm_name), TRUE, FALSE),
+         hysteroscopy = ifelse(grepl('HYSTEROSCOPY', first_confirm_name), TRUE, FALSE)) %>%
+  CreateTableOne(data=., vars=c('ultrasound', 'mri', 'ct', 'hysterectomy',
+                                'myomectomy', 'oophorectomy', 'salpingectomy', 'hysteroscopy'),
+                 strata='site_baseline')
+```
+
+##### {.unnumbered}
+
+#### {.unnumbered}
+
+### Site patient characteristics {.tabset}
+
+#### By baseline site
+
+Overall, these might be pregnant patients at baseline?
+Compared to commonly outpatient patients, patients whose most common site was inpatient were/had:
+
+- slightly more likely to be Endo case
+- slightly lower HCU at baseline
+- slightly younger
+- lower proportion using HC
+- more likely to be parous
+- less likely to be partnered
+- higher BMI
+- more likely to be unemployed & students
+- much more likely to be Hispanic and less likely to be NH White
+- more likley to speak Spanish
+
+```{r site_tab1, results='asis'}
+ch1_final %>%
+  mutate(final_outcome_group = case_when(grepl('Both', final_outcome_status)~'Both',
+                                         TRUE~final_outcome_status),
+         site_type = case_when(grepl('OP|Family|Tele', site_baseline)~'Outpatient', 
+                               TRUE~'Inpatient')) %>%
+  tableby(site_type~final_outcome_group + hcu_baseline + age_20160801 + HC_status + parity_binary + 
+                  marital_status_final + bmi_baseline + insur_status + 
+                  employ_simple_final + race_ethnic_final + language_eng_sp, data=.) %>%
+  summary(., labelTranslations = c(pat_labs, ses_labs))
+```
+
+#### By baseline borough
+
+Across the boroughs:
+
+- UF outcome: highest in Bronx, lowest in Other/Westchester
+- Endo outcome: highest in Richmond, but pretty equal across (lowest in Westchester)
+- HCU at baseline: highest in Kings, lowest in Westchester/Nassau
+- Age: Similar across, lowest in Richmond
+- HC use: highest in Queens, lowest in Richmond
+- Parity: highest in Kings, lowest in Manhattan
+- Relationship status: highest in Nassau, lowest in Bronx
+- BMI: highest in Bronx, lowest in Manhattan
+- Insurance type: most private in Manhattan, most public in Bronx/Queens
+- Employment: lowest in Kings
+
+```{r borough_tab1, results='asis'}
+ch1_final %>%
+  mutate(final_outcome_group = case_when(grepl('Both', final_outcome_status)~'Both',
+                                         TRUE~final_outcome_status),
+         county_final = case_when(county_name %in% c('New York County', 'Kings County',
+                                              'Bronx County', 'Queens County',
+                                              'Richmond County', 'Westchester County',
+                                              'Nassau County')~county_name,
+                                   TRUE~'Other')) %>%
+  tableby(county_final~final_outcome_group + hcu_baseline + age_20160801 + HC_status + parity_binary + 
+                  marital_status_final + bmi_baseline + insur_status + 
+                  employ_simple_final + race_ethnic_final + language_eng_sp, data=.) %>%
+  summary(., labelTranslations = c(pat_labs, ses_labs))
+```
+
+#### Site by borough
+
+```{r borough_site, results='asis'}
+ch1_final %>%
+  mutate(county_final = case_when(county_name %in% c('New York County', 'Kings County',
+                                              'Bronx County', 'Queens County',
+                                              'Richmond County', 'Westchester County',
+                                              'Nassau County')~county_name,
+                                   TRUE~'Other')) %>%
+  tableby(county_final~site_baseline, data=.) %>%
+  summary(., labelTranslations = c(pat_labs, ses_labs))
+```
+
+#### {.unnumbered}
+
+### {.unnumbered}

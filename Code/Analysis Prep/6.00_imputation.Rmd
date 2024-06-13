@@ -1,0 +1,149 @@
+---
+title: "Imputation code"
+author: "Mia Charifson"
+date: "2024-05-29"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+knitr::opts_knit$set(root.dir = '/Users/miacharifson/Library/CloudStorage/OneDrive-NYULangoneHealth/Charifson Dissertation/')
+
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+library(arsenal)
+library(mice)
+```
+
+Last updated on: `r today()`.
+
+```{r load}
+df_all <- read.csv('Data/Derived/all_data_noImpute_20240613.csv')
+```
+
+This is the final curation step before analysis. The following must be accomplished: 
+
+- Final forms of all variables must be created (rolling up categorical variables, etc)
+- Impute missing variables for all patients
+- Check that imputation values are logical
+- Write out imputed datasets for analysis
+
+## Prep data for imputation
+
+Goals here are to get all cells above n=500, maintaining granularity as much as possible.
+
+Reminder: for variables we are imputing, we want to make sure all categories are appropriate for analysis and informative to our causal structure. For variables, we are using to inform the predictive matrix for imputation, we want to make sure the categories are logical and informative for the missingness structure. 
+
+```{r site}
+# look at data as is
+CreateTableOne(data = df_all, var=c('site_baseline'), includeNA = TRUE)
+```
+QUESTION: Do we need to roll up telemedicine (n=43)? These encounters have no location but I can assign them Manhattan OP? or NA?
+
+```{r employment}
+# look at data as is
+CreateTableOne(data = df_all, var=c('employ_simple_final'), includeNA = TRUE)
+```
+QUESTION: What would be a logical roll-up for retired?
+
+```{r race_ethnic}
+# look at data as is
+CreateTableOne(data = df_all, var=c('race_final', 'ethnicity_final', 'race_ethnic_final'), includeNA = TRUE)
+
+# roll native hawaiian and pacific islander together -- make unmapped NA
+df_all <- df_all %>% 
+  mutate(race_final_new = case_when(race_final %in% c('Native Hawaiian', 'Pacific Islander')~'Native Hawaiian/Pacific Islander',
+                                    TRUE~race_final))
+
+# look at data as is
+CreateTableOne(data = df_all, var=c('race_final_new', 'ethnicity_final'), includeNA = TRUE)
+```
+QUESTION: Is that rolled up enough? Alternatively, I could combine make the roll-up Asian/PI and add NH to AI/AN and make the category Native.
+
+```{r symptoms}
+# make symptom group variable
+df_all<- df_all %>% 
+  mutate(first_symptom_group = case_when(grepl('R10.2|F52.6|N94.1|N94.0|M54.5', first_symptom_icd10s)~'Pain',
+                                   grepl('N94.[4-6]|N93.0|N93.8|N93.9|N92.0|N92.1|D50.0',
+                                         first_symptom_icd10s)~'Menstrual/Bleeding',
+                                   grepl('N83.0|N83.2', first_symptom_icd10s)~'Ovarian cysts',
+                                   grepl('N73.9', first_symptom_icd10s)~'PID',
+                                   grepl('N97.9', first_symptom_icd10s)~'Infertility',
+                                   grepl('N32.9|K59.00|N39.3|R19.7', first_symptom_icd10s)~'Genito-urinary'))
+# look at data as is
+CreateTableOne(data = df_all, var='first_symptom_group', includeNA = TRUE)
+# no roll up needed
+```
+QUESTION: Originally, I put PID & Ovarian cysts together since they are both common mis-diagnoses or intermediary diagnosis for Endo and to a lesser extent, UF. However, they are somewhat different with regards to symptom profiles (although overlapping). The main distinction is that PID shares some urinary symptoms and therefore, might also go well with genito-urinary symptoms. Should I move it there? Keep is separate even though n is small?
+
+```{r provider_specialty}
+## need to separate provider specialties
+general_care <- c('ACUTE CARE NURSE PRACTITIONER','ADULT HEALTH NURSE PRACTITIONER','GENERAL PRACTICE'
+                  ,'MEDICINE, ADULT','MEDICINE, FAMILY MEDICINE','MEDICINE, INTERNAL MEDICINE','NURSE PRACTITIONER'
+                  , "FAMILY NURSE PRACTITIONER", "PEDIATRIC NURSE PRACTITIONER", "PEDIATRICS, ADOLESCENT MEDICINE", "PEDIATRICS, GENERAL"
+                  , "PHYSICIAN ASSISTANT", "PHYSICIAN ASSISTANT, MEDICAL", "REGISTERED NURSE")
+obgyn_care <- c('OBSTETRICS & GYNECOLOGY','OBSTETRICS & GYNECOLOGY NURSE PRACTITIONER','OBSTETRICS GYNECOLOGY, GENERAL', "WOMEN'S HEALTH NURSE PRACTITIONER")
+gyn_care <- c('GYNECOLOGY, GENERAL','GYNECOLOGY, REPRODUCTIVE ENDOCRINOLOGY','GYNECOLOGY, URO-GYNECOLOGY','UROLOGY, URO-GYNECOLOGY', "GYNECOLOGY, GYNECOLOGIC ONCOLOGY")
+endocrine_care <- c('MEDICINE, ENDOCRINOLOGY','MEDICINE, ENDOCRINOLOGY, DIABETES, OBESITY, METABOLISM',  "PEDIATRIC ENDOCRINOLOGY")
+ob_care <- c('OBSTETRICS, GENERAL','OBSTETRICS, MATERNAL FETAL MEDICINE')
+ed_care <- c("EMERGENCY MEDICINE, ADULT", "EMERGENCY MEDICINE, GENERAL", "EMERGENCY MEDICINE, PEDIATRICS", "URGENT CARE")
+
+# make unique variables for each major provider grouping
+prov_specialty <- df_all %>%
+  group_by(pat_id) %>%
+  mutate(index_enc_OBGYN = (grepl(paste(c(obgyn_care, gyn_care, ob_care),collapse="|"),toupper(index_provider_specialty))),
+         index_enc_general = (grepl(paste(general_care,collapse="|"),toupper(index_provider_specialty))),
+         index_enc_endocrine = (grepl(paste(endocrine_care,collapse="|"),toupper(index_provider_specialty))),
+         index_enc_emergency = (grepl(paste(ed_care,collapse="|"),toupper(index_provider_specialty)))) %>%
+  select(pat_id, index_provider_specialty, contains('index_enc')) %>%
+  mutate(count_unique_prov = sum(index_enc_OBGYN, index_enc_general, index_enc_endocrine, index_enc_emergency, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(index_enc_prov_final = case_when(index_enc_OBGYN~'OBGYN', 
+                                          index_enc_emergency~'Emergency', 
+                                          index_enc_endocrine~'Endocrine', 
+                                          index_enc_general~'General'))
+
+#length(which(prov_specialty$count_unique_prov > 1))
+# only 1055 with more than one
+#table(prov_specialty$index_provider_specialty[which(prov_specialty$count_unique_prov>1)])
+
+# look at rolled-up data
+CreateTableOne(data = prov_specialty, var='index_enc_prov_final', includeNA = TRUE)
+# no roll up needed
+```
+QUESTION: I chose to prioritize the index provider specialty (if we have to keep one) as OBGYN > Emergency > Endocrine > General. This means that if a patient sees providers of any two or more of these specialties the one that gets recorded for their index encounter goes in that order. I chose OBGYN first since thats most informative to them seeing a relevant provider, Emergency second since that suggests they sought emergency care (not regular care), then Endocrine for some sort of non-OBGYN specialty care, and finally general the least specialized to detect UF/Endo. The prioritization is basically organized on two axes: proximity to relevant care (ability to dx the conditions) and care seeking information (ED > general). Does this make sense? 
+
+Perhaps it should just be on relevance to diagnosis, OBGYN > Endocrine > General > Emergency. Swap general and endocrine?
+
+```{r hazard_vars}
+nelsonaalen(data, timevar, statusvar)
+```
+
+# code from bonneville https://github.com/survival-lumc/CauseSpecCovarMI
+
+## Look at missingness prior to imputation
+
+## Prep imputation
+
+Prep needed for imputation: 
+1. Select variables to include in predcitor Matrix
+2. Specify predictor matrix
+3. Specify imputation methods for each variable
+
+## Imputation
+
+```{r test_mice}
+sample(data, 1000)
+```
+
+## Check imputation
+
+## Write out imputed data sets
+
+Subset for each chapter

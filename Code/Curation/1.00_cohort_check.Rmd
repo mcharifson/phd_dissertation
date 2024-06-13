@@ -1,0 +1,910 @@
+---
+title: "Step 1.0: Cohort Check"
+author: "Mia Charifson"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output: 
+  html_document:
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = '/Users/miacharifson/Library/CloudStorage/OneDrive-NYULangoneHealth/Charifson Dissertation/')
+```
+
+```{r lib, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(lubridate)
+library(tableone)
+library(arsenal)
+library(readxl)
+library(ggalluvial)
+```
+
+```{r load}
+pat_cohort <- read.csv('Data/Epic/table1_pat_cohort.csv')
+enc_relevant1 <- read.csv('Data/Epic/table2_enc_relevant_2016-2017.csv')
+enc_relevant2 <- read.csv('Data/Epic/table2_enc_relevant_2018-2019.csv')
+enc_relevant3 <- read.csv('Data/Epic/table2_enc_relevant_2020-2021.csv')
+enc_relevant4 <- read.csv('Data/Epic/table2_enc_relevant_2022-2023.csv')
+enc_ed <- read.csv('Data/Epic/table2_enc_ed.csv')
+menopause <- read.csv('Data/Epic/table3_dx_menopause.csv')
+surgery <- read.csv('Data/Epic/table4_surgery.csv')
+uf_endo <- read.csv('Data/Epic/table3_dx_outcomes.csv')
+uf_endo_filled_dates <-read.csv('Data/Epic/fill_missing_dx_dates.csv')
+insur_baseline <- read.csv('Data/Epic/table6_insurance_baseline.csv')
+site_map <- read.csv('Data/External/dept_name_sorting.csv')
+```
+
+# Cohort check and variables
+
+Goals of this document:
+
+1. Check all inclusion and exclusion criteria closely in cohort provided by Chuan
+2. Check the burn-in period for encounters and whether they re-engage within a year from entry into cohort (LTFU at baseline)
+3. Derive loss to follow-up during the follow-up period & during COVID-19
+4. Derive censoring due to menopause, death, receiving a hysterectomy or bilateral oophorectomy
+5. Define healthcare utilization at baseline and during follow-up
+
+## 1.1. Check all relevant cohort inclusion and exclusion criteria {.tabset}
+
+Entry year of cohort: August 1, 2016 - December 31, 2017
+
+Inclusion criteria: 
+
+- Female
+- Must have uterus and at least one ovary
+- **Active patient with relevant care during entry year**
+- **16 to 50 years old**
+- **Alive at entry year of cohort**
+- **Disease-free at entry year of cohort**
+- **Regular relevant care in two years from entry into cohort**
+
+Exclusion criteria: 
+
+- **Hx of hysterectomy or bilateral oophorectomy**
+- Primary amenorrhea or sexual development disorder
+- **No relevant care in the second year of cohort**
+
+Bold criteria are ones I can check in this document. The other criteria were already applied by Chuan and cannot be retroactively checked based on the data but review of her code confirms their appropriate application. 
+
+```{r}
+## reduce to first encounter
+pat_unique <- pat_cohort %>%
+  group_by(pat_id) %>%
+  mutate(num_enc_index_yr = n()) %>%
+  filter(enc_date == min(enc_date)) %>%
+  distinct()
+  
+# paste together encounter ID and provider specialty if more than one on the date of index encounter
+pat_unique <- pat_unique %>%
+  group_by(pat_id) %>%
+  summarise(index_enc_date = min(enc_date),
+            death_date = paste0(unique(death_date), collapse = ', '),
+            pat_living_stat_c = mean(pat_living_stat_c, na.rm=TRUE),
+            age_20160801 = min(age_20160801, na.rm=TRUE),
+            gender = paste0(unique(gender), collapse = ', '),
+            pat_living_stat_c = mean(pat_living_stat_c, na.rm=TRUE),
+            all_provider_specialty = paste0(unique(provider_specialty), collapse = ', '),
+            all_pat_enc_csn_id = paste0(unique(pat_enc_csn_id), collapse = ', '),
+            num_enc_index_yr = mean(num_enc_index_yr, na.rm=TRUE),
+            .groups='drop') %>%
+  mutate(index_enc_date = as.Date(index_enc_date))
+```
+
+### Dates of entry into cohort (index encounter)
+
+```{r}
+pat_unique %>%
+  select(index_enc_date) %>%
+  summary()
+```
+
+```{r}
+pat_unique %>%
+  group_by(index_enc_date) %>%
+  summarise(count=n(), .groups='drop') %>%
+  mutate(cumulative_count = cumsum(count)) %>%
+  ggplot(data=., aes(x=index_enc_date, y=cumulative_count)) +
+  geom_line() +
+  ylab('Cumulative Count of Eligible Patients') +
+  xlab('Date of Index Encounter') +
+  theme_bw()
+```
+
+### Provider specialty at index encounter
+
+```{r}
+## need to separate provider specialties
+general_care <- c('ACUTE CARE NURSE PRACTITIONER'
+                  ,'ADULT HEALTH NURSE PRACTITIONER'
+                  ,'GENERAL PRACTICE'
+                  ,'MEDICINE, ADULT'
+                  ,'MEDICINE, FAMILY MEDICINE'
+                  ,'MEDICINE, INTERNAL MEDICINE'
+                  ,'NURSE PRACTITIONER'
+                  , "FAMILY NURSE PRACTITIONER"
+                  , "PEDIATRIC NURSE PRACTITIONER"
+                  , "PEDIATRICS, ADOLESCENT MEDICINE"
+                  , "PEDIATRICS, GENERAL"
+                  , "PHYSICIAN ASSISTANT"
+                  , "PHYSICIAN ASSISTANT, MEDICAL"
+                  , "REGISTERED NURSE")
+obgyn_care <- c('OBSTETRICS & GYNECOLOGY'
+                ,'OBSTETRICS & GYNECOLOGY NURSE PRACTITIONER'
+                ,'OBSTETRICS GYNECOLOGY, GENERAL'
+                , "WOMEN'S HEALTH NURSE PRACTITIONER")
+gyn_care <- c('GYNECOLOGY, GENERAL'
+              ,'GYNECOLOGY, REPRODUCTIVE ENDOCRINOLOGY'
+              ,'GYNECOLOGY, URO-GYNECOLOGY'
+              ,'UROLOGY, URO-GYNECOLOGY'
+              , "GYNECOLOGY, GYNECOLOGIC ONCOLOGY")
+endocrine_care <- c('MEDICINE, ENDOCRINOLOGY','MEDICINE, ENDOCRINOLOGY, DIABETES, OBESITY, METABOLISM'
+                    ,  "PEDIATRIC ENDOCRINOLOGY")
+ob_care <- c('OBSTETRICS, GENERAL','OBSTETRICS, MATERNAL FETAL MEDICINE')
+ed_care <- c("EMERGENCY MEDICINE, ADULT"
+                , "EMERGENCY MEDICINE, GENERAL"
+                , "EMERGENCY MEDICINE, PEDIATRICS"
+                , "URGENT CARE")
+all_relevant_providers <- c(general_care, gyn_care, ob_care, obgyn_care, endocrine_care, ed_care)
+```
+
+```{r}
+pat_unique %>%
+  mutate(`OBGYN general` = case_when(grepl(paste(obgyn_care,collapse="|"),
+                                      toupper(all_provider_specialty))~TRUE,TRUE~FALSE),
+         Gynecology = case_when(grepl(paste(gyn_care,collapse="|"),
+                                      toupper(all_provider_specialty))~TRUE,TRUE~FALSE),
+         Obstetrics = case_when(grepl(paste(ob_care,collapse="|"),
+                                     toupper(all_provider_specialty))~TRUE,TRUE~FALSE),
+         `General Care` = case_when(grepl(paste(general_care,collapse="|"),
+                                        toupper(all_provider_specialty))~TRUE,TRUE~FALSE),
+         Endocrinology = case_when(grepl(paste(endocrine_care,collapse="|"),
+                                         toupper(all_provider_specialty))~TRUE,TRUE~FALSE),
+         `Emergency Care` = case_when(grepl(paste(ed_care,collapse="|"),
+                                         toupper(all_provider_specialty))~TRUE,TRUE~FALSE))%>%
+  CreateCatTable(data=., vars=c('OBGYN general', 'Gynecology', 'Obstetrics', 
+                                'General Care', 'Endocrinology', 'Emergency Care'))
+```
+Since patients might attend more than one encounter on their index date, the percent adds up to more than 100%. Generally the majority of patients attended some general care provider at their index encounter.
+
+### Age distribution
+
+```{r}
+print(CreateTableOne(data=pat_unique, var='age_20160801', includeNA=TRUE), nonnormal='age_20160801')
+```
+
+A number of patients (n = `r length(unique(menopause$pat_id[which(as.Date(menopause$dx_date)<= '2016-08-01')]))`) went through menopause before the beginning of cohort entry and should be excluded. 
+
+### Alive
+
+```{r}
+pat_unique$death_date <- ifelse(pat_unique$death_date=='NULL', NA, pat_unique$death_date)
+pat_unique$death_date <- parse_date_time(pat_unique$death_date, orders = 'Ymd HMS', quiet=TRUE)
+```
+
+```{r, eval=FALSE}
+summary(pat_unique$death_date)
+pat_unique %>% filter(index_enc_date >= death_date)
+# double check that everyone indicated as dead has a death date
+length(which(pat_cohort$pat_living_stat_c == 2 & pat_cohort == 'NULL')) #TRUE
+```
+
+As it should be, there are `r length(which(pat_unique$index_enc_date >= pat_unique$death_date))` patients who have died prior to their index encounter date. 
+
+### Disease-free at baseline
+
+```{r}
+# Combine tables that need combining
+uf_endo_filled <- uf_endo %>%
+  mutate(dx_date = as.Date(dx_date, "%Y-%m-%d")) %>%
+  ## remove those missing a dx date
+  filter(!is.na(dx_date) & icd10 != 'N80.03') %>%
+  ## add in filled dx_date where missing
+  bind_rows(uf_endo_filled_dates %>% 
+              filter(icd10 != 'N80.03') %>%
+              mutate(dx_date_filled = as.Date(dx_date_filled, "%Y-%m-%d"),
+                     dx_date = as.Date(dx_date, "%Y-%m-%d"),
+                     dx_date = case_when(is.na(dx_date)~dx_date_filled, TRUE~dx_date),
+                     pat_enc_csn_id = as.character(pat_enc_csn_id))) %>%
+  ## add in index encounter date
+  left_join(pat_unique %>% select(pat_id, index_enc_date), by = 'pat_id')
+```
+
+```{r}
+uf_endo_before_baseline <- uf_endo_filled %>%
+  group_by(pat_id) %>%
+  filter(dx_date == pmin(dx_date, na.rm=TRUE)) %>%
+  ungroup() %>%
+  filter(dx_date <= '2016-08-01' | dx_date <= index_enc_date)
+
+length(which(uf_endo_filled$dx_date <= uf_endo_filled$index_enc_date))
+```
+
+There are `r length(unique(uf_endo_before_baseline$pat_id))` patients who have a UF or Endo diagnosis prior to their index encounter or before entry into cohort that were missed in initial cohort screening. These should be excluded further from inclusion.
+
+`r length(unique(uf_endo_before_baseline$pat_id[which(uf_endo_before_baseline$dx_type == 'Referral Diagnosis')]))` of them are referral diagnoses. `r length(unique(uf_endo_before_baseline$pat_id[which(uf_endo_before_baseline$dx_date == uf_endo_before_baseline$index_enc_date)]))` of them are diagnoses received on the same date as their index encounter.
+
+```{r}
+# look to prevalent dx in the first year
+uf_endo_baseline_prevalent <- uf_endo_filled %>%
+  filter(icd10 %in% c('Z86.018', 'Z87.42')) %>%
+  filter(dx_date >= index_enc_date & dx_date <= '2017-12-31') 
+```
+
+There are also `r length(unique(uf_endo_baseline_prevalent$pat_id))` patients who have a history of UF or Endo diagnosis in the first year of baseline. We will assume these are prevalent cases at baseline. These should be excluded further from inclusion.
+
+```{r, eval=FALSE}
+missing_dx_encounters <- uf_endo_before_baseline %>%
+  filter(dx_type != 'Referral Diagnosis' & dx_date != index_enc_date)
+## there are some encounters not being counted as index encounters where patients are diagnosed with UF/Endo
+## these are mostly none relevant care diagnoses (likely not encounter diagnoses but medical histories)
+## see enc_w_uf_endo_dx.sql for more details
+```
+
+### Regular relevant care
+
+Defined as 2+ relevant care visits through first two years of follow-up
+
+```{r inpatient_outpatient_join}
+# take all encounters after a patients index encounter and with relevant care
+enc_ip_op <- rbind(enc_relevant1, enc_relevant2, enc_relevant3, enc_relevant4)
+```
+
+```{r join_encounters}
+ed_all <- enc_ed %>%
+  left_join(pat_unique %>% select(pat_id, index_enc_date), by='pat_id') %>%
+  mutate(enc_date = as.Date(enc_date)) %>%
+  select(pat_id, pat_enc_csn_id, enc_type, enc_date, longest_prov_specialty, index_enc_date, first_loc_name,
+         first_dep_external_name) %>%
+  rename(provider_specialty = longest_prov_specialty, 
+         loc_name = first_loc_name,
+         dep_external_name = first_dep_external_name)
+
+ip_op_all <- enc_ip_op %>%
+  left_join(pat_unique %>% select(pat_id, index_enc_date), by='pat_id') %>%
+  mutate(enc_date = as.Date(enc_date)) %>%
+  select(pat_id, pat_enc_csn_id, enc_type, enc_date, provider_specialty, index_enc_date, loc_name)
+
+all_enc <- bind_rows(ed_all, ip_op_all)
+```
+
+To be eligible for the cohort, each patient must have at least two relevant care encounter in the first two years of follow-up (Jan 2018-Dec 2019) to consider having maintained contact with NYU, which establishes that they have two consecutive (August 2016-2017 and 2018) years of relevant care. This is to remove temporary patients from the cohort. 
+
+```{r fu_past_baseline}
+fu_past_baseline <- all_enc %>%
+  filter(enc_date >= '2018-01-01' & enc_date <= '2019-12-31') %>%
+  group_by(pat_id) %>%
+  filter(n()>=2) %>%
+  distinct(pat_id)
+```
+
+```{r fu_past_baseline_obgyn_only}
+all_obgyn_care <- c(obgyn_care,gyn_care,ob_care)
+
+fu_past_baseline_obgyn <- all_enc %>%
+  filter(grepl(paste(all_obgyn_care,collapse="|"), toupper(provider_specialty))) %>%
+  filter(enc_date >= '2018-01-01' & enc_date <= '2019-12-31') %>%
+  group_by(pat_id) %>%
+  filter(n()>=2) %>%
+  distinct(pat_id)
+```
+
+There are `r dim(fu_past_baseline)[1]` patients who maintain relevant care in the first two years of follow-up.  This is `r round(dim(fu_past_baseline)[1]/dim(pat_unique)[1], 2)*100`% of originally eligible patients.
+
+```{r last_enc_date}
+## grab the last encounter date for censoring of all patients
+last_enc_date <- all_enc %>%
+  filter(enc_date >= index_enc_date) %>%
+  group_by(pat_id) %>%
+  summarise(last_enc_date = max(enc_date), .groups='drop')
+```
+
+```{r unique_final}
+pat_unique_final <- pat_unique %>%
+  left_join(last_enc_date, by='pat_id') %>%
+  filter(!pat_id %in% uf_endo_before_baseline$pat_id) %>%
+  filter(!pat_id %in% uf_endo_baseline_prevalent$pat_id) %>%
+  filter(!pat_id %in% unique(menopause$pat_id[which(as.Date(menopause$dx_date)<= '2016-08-01')])) %>%
+  filter(pat_id %in% fu_past_baseline$pat_id) %>%
+  ## add flag for patients with obgyn care at baseline and in first two years
+  mutate(obgyn_care_cohort = case_when(grepl(paste(all_obgyn_care,collapse="|"), toupper(all_provider_specialty)) &
+                                         pat_id %in% fu_past_baseline_obgyn$pat_id~TRUE,
+                                       TRUE~FALSE))
+```
+
+The final N for eligible patients (not based on missingness) are `r dim(pat_unique_final)[1]` patients who maintain relevant care past Dec 2018.  This is `r round(dim(pat_unique_final)[1]/dim(pat_unique)[1], 2)*100`% of originally eligible patients.
+
+Among these, there are `r length(which(pat_unique_final$obgyn_care_cohort))` patients who receive OBGYN care at baseline and through the first two years of follow-up. These are a potential sensitivity analysis. This is `r round(length(which(pat_unique_final$obgyn_care_cohort))/dim(pat_unique_final)[1], 2)*100`% of the whole cohort.
+
+### {.unnumbered}
+
+## 1.2. Loss to follow-up {.tabset}
+
+### During follow-up
+```{r}
+# identify any gaps in care for more than two years
+all_FU_w_gaps <- all_enc %>%
+  filter(pat_id %in% pat_unique_final$pat_id) %>%
+  ## collapse across encounters on the same day
+  distinct(pat_id, pat_enc_csn_id, enc_date, index_enc_date) %>%
+  arrange(pat_id, enc_date) %>%
+  group_by(pat_id) %>%
+  mutate(next_enc_date = lead(enc_date),
+         wks_to_next_enc = as.numeric(next_enc_date-enc_date)/7) %>%
+  mutate(wks_to_next_enc = case_when(is.na(wks_to_next_enc)~as.numeric(as.Date('2023-08-01')-enc_date)/7,
+                                     TRUE~wks_to_next_enc)) %>%
+  # define their most recent encounter
+  mutate(most_recent_enc_date = max(enc_date)) %>%
+  ungroup()
+```
+
+```{r}
+# for the whole cohort what is the distribution of the longest gap in care
+all_FU_w_gaps %>%
+  group_by(pat_id) %>%
+  filter(wks_to_next_enc == max(wks_to_next_enc, na.rm=TRUE)) %>%
+  ungroup() %>% 
+  ggplot(data=., aes(x=wks_to_next_enc)) +
+  geom_histogram(binwidth=20) +
+  ylab('Count') +
+  xlab('Longest Gap in Care (weeks)') +
+  geom_vline(xintercept=104, color='orange') + # 2 years
+  geom_vline(xintercept=156, color='red') + # 3 years
+  theme_bw()
+```
+The above graph shows the distribution of longest gap in relevant care for a given patient in weeks. As seen the distribution is skewed to the left. The orange line indicates two years and the red line indicates three years of a gap in care. Based on this graph, we expand the partial LTFU definition to be a three year gap in care or more. Complete LTFU is defined as patients whose last encounter is three years of more before the end of follow-up.
+
+```{r}
+# for each patient take their max gap and their time from the end of follow-up
+ltfu_unique <- all_FU_w_gaps %>%
+  ## select all gaps where a patient disengages for two years or more
+  filter(wks_to_next_enc > 156 & enc_date > index_enc_date) %>%
+  group_by(pat_id) %>%
+  ## find the earliest date when they do this
+  filter(enc_date == min(enc_date)) %>%
+  ## if this date is not the same as their last
+  ungroup() %>%
+  mutate(ltfu_status = case_when(enc_date == most_recent_enc_date ~ 'complete', 
+                                 enc_date != most_recent_enc_date ~ 'partial'),
+         ltfu_date = enc_date,
+         ltfu_reengage_date = next_enc_date)
+```
+
+The number of patients who completely disengage at some point during follow-up (disengage three years or more before the end of follow-up) is n=`r length(which(ltfu_unique$ltfu_status == 'complete'))`. 
+
+The number of patients who partially disengage at some point during follow-up (disengage for three years or more but re-engage in relevant care before the end of follow-up) is n=`r length(which(ltfu_unique$ltfu_status == 'partial'))`. 
+
+```{r}
+ltfu_unique %>%
+  group_by(ltfu_date, ltfu_status) %>%
+  summarise(count=n(), .groups='drop') %>%
+  group_by(ltfu_status) %>%
+  mutate(cumulative_count = cumsum(count)) %>%
+  ungroup() %>%
+  ggplot(data=., aes(x=ltfu_date, y=cumulative_count, color=ltfu_status)) +
+  geom_line() +
+  ylab('Cumulative Count of Patients Lost-to-follow-up') +
+  xlab('Date of LTFU') +
+  theme_bw()
+```
+
+NOTE: this includes all patients regardless of other censoring and case diagnosis. A more accurate summary of LTFU will be at the end of the document. 
+
+```{r}
+# time between initial LTFU and re-engage date for partial LTFU
+ltfu_unique %>%
+  filter(ltfu_status=='partial') %>%
+  mutate(time_to_reengage = as.numeric(difftime(ltfu_reengage_date, ltfu_date, units='day'))) %>%
+  #summary()
+  ggplot(data=., aes(x=time_to_reengage)) +
+  geom_histogram(bins=60, fill='gray', color='black') +
+  geom_vline(xintercept=365*3, color='orange') +
+  geom_vline(xintercept=365*4, color='red') +
+  xlab('Time from initial LTFU to next relevant care encounter') +
+  ylab('Count of patients') +
+  theme_bw()
+```
+
+```{r, eval=FALSE, include=FALSE}
+ltfu_unique %>%
+  filter(ltfu_status=='partial') %>%
+  mutate(time_to_reengage = as.numeric(difftime(ltfu_reengage_date, ltfu_date, units='day'))/365.4) %>%
+  summary()
+```
+
+The orange line indicates three years (the minimum time to be considered partial LTFU). The red line indicates four years since last relevant care encounter. The median time to next relevant care encounter is 3.44 years and the first quartile is 2.99 years. 
+
+### COVID-19 Loss to follow up
+
+I will create separate inverse probability censoring weights for this subgroup (the former being identified as no in-person encounters from March 15, 2020-July 1, 2021 [dates of closing and reopening of NYC] but then seen again).
+
+This will be defined as any patients whose last encounter was after COVID-19 (later than 2021-07-01) but during the lock down period they have no in-person encounters. 
+
+```{r covid19_ltfu}
+## capture a list of patients NOT LTFU during COVID-19
+covid_not_LTFU <- all_enc %>%
+  # Exclude telemedicine encounters
+  filter(enc_type != 'Telemedicine') %>%
+  # Filter to dates of interest 
+  filter(enc_date >= '2020-03-15' & enc_date <= '2021-07-01') %>%
+  distinct(pat_id)
+
+pat_unique_final$ltfu_covid <- ifelse(!pat_unique_final$pat_id %in% covid_not_LTFU$pat_id & pat_unique_final$last_enc_date >= '2021-07-01', TRUE, FALSE)
+```
+
+There are `r length(which(pat_unique_final$ltfu_covid))` with no relevant in-person encounters during the COVID-19 lock down for NYC. This is `r round((length(which(pat_unique_final$ltfu_covid))/length(unique(pat_unique_final$pat_id)))*100, 2)`% of patients overall. 
+
+Later I will compare the demographics of these patients to other patients, to see if they may informatively be censored in the data. 
+
+### {.unnumbered}
+
+## 1.3. Censoring not due to diagnosis of UF or Endo {.tabset}
+
+### Death
+
+There are `r length(which(!is.na(pat_unique_final$death_date)))` patient who died during the follow-up period. 
+
+```{r}
+pat_unique_final %>%
+  filter(!is.na(death_date)) %>%
+  group_by(death_date) %>%
+  summarise(count=n(), .groups='drop') %>%
+  mutate(cumulative_count = cumsum(count)) %>%
+  ggplot(data=., aes(x=death_date, y=cumulative_count)) +
+  geom_line() +
+  ylab('Cumulative Count of Deceased Patients') +
+  xlab('Date of Death') +
+  theme_bw()
+```
+
+### Hysterectomy or bilateral oophorectomy
+
+```{r, eval=FALSE}
+# do I need to use codes?
+cpt_codes <- c('1962', '38589', '58150', '58180', '58210', '58260', 
+               '58541', '58542', '58544', '58550', '58553', '58570', 
+               '58572', '58573', 'SHX1221', 'SHX1223', 'SHX1926', 'SHX1934', 
+               'SHX209', 'SHX210', 'SHX21050', 'SHX2362', 'SHX2548', 'SHX81', 
+               'SHX82', 'SUR292', 'SUR658', 'SUR661', 'SUR797', 'SUR800')
+
+length(which(surgery$procedure_code %in% cpt_codes)) ## none of these show up table so ignore
+```
+
+The surgery table includes completed and scheduled surgeries so I need to remove those prior to cohort entry and after the last date of follow-up.
+
+```{r}
+## only focus on surgeries during follow-up
+surgery_FU <- surgery %>%
+  mutate(surgery_date = as.Date(surgery_date)) %>%
+  filter(surgery_date > '2016-08-01' & surgery_date <= '2023-08-01') 
+```
+
+```{r, eval=FALSE, include=FALSE}
+# Raw counts of hysterectomy based on procedure names:
+surgery_FU %>%
+  filter(grepl('HYSTERECTOMY', procedure_name)) %>%
+  group_by(procedure_name) %>%
+  summarise(count=n(), .groups='drop')
+```
+
+```{r, eval=FALSE, include=FALSE}
+# Raw counts of bilateral oophorectomy based on procedure names:
+surgery_FU %>%
+  filter(grepl('OOPHORECTOMY', procedure_name) & 
+           grepl('BILATERAL', procedure_name) &
+           !grepl('HYSTERECTOMY', procedure_name)) %>%
+  group_by(procedure_name) %>%
+  summarise(count=n())
+```
+
+```{r, eval=FALSE, include=FALSE}
+# Raw counts of oophorectomy + bilateral based on procedure names:
+surgery_FU %>%
+  filter(grepl('OOPHORECTOMY', procedure_name) 
+         & grepl('Bilateral', laterality)
+         & !grepl('HYSTERECTOMY|BILATERAL', procedure_name)) %>%
+  group_by(procedure_name, laterality) %>%
+  summarise(count=n())
+```
+
+```{r}
+# mark procedure names from above
+censor_surg <- surgery_FU %>%
+  mutate(hysterectomy = case_when(grepl('HYSTERECTOMY', procedure_name)~TRUE),
+         bilateral_oophorectomy = case_when(grepl('OOPHORECTOMY', procedure_name) & 
+                                    grepl('BILATERAL', procedure_name)~TRUE,
+                                  grepl('OOPHORECTOMY', procedure_name) & 
+                                    grepl('Bilateral', laterality)~TRUE)) %>%
+  filter(hysterectomy | bilateral_oophorectomy)
+```
+
+```{r, eval=FALSE}
+# look at patient with multiple observations
+censor_surg %>%
+  group_by(pat_id) %>%
+  filter(n()>1) %>%
+  arrange(pat_id, surgery_date) %>%
+  View()
+```
+
+```{r}
+# turn into observations per patient id
+censor_surg_unique <- censor_surg %>%
+  filter(pat_id %in% pat_unique_final$pat_id) %>%
+  group_by(pat_id, surgery_date) %>%
+  mutate(hysterectomy = case_when(sum(hysterectomy, na.rm=T)>=1~TRUE),
+         bilateral_oophorectomy = case_when(sum(bilateral_oophorectomy, na.rm=T)>=1~TRUE)) %>%
+  ungroup() %>%
+  select(pat_id, surgery_date, hysterectomy, bilateral_oophorectomy) %>%
+  distinct() %>%
+  group_by(pat_id) %>%
+  filter(surgery_date==min(surgery_date)) %>%
+  ungroup() %>%
+  rename(censor_surg_date = surgery_date)
+```
+
+There are `r dim(censor_surg_unique)[1]` patients who receive a hysterectomy or bilateral oophorectomy at some point during follow-up. `r length(which(censor_surg_unique$hysterectomy & is.na(censor_surg_unique$bilateral_oophorectomy)))` patients received a hysterectomy only, `r length(which(is.na(censor_surg_unique$hysterectomy) & censor_surg_unique$bilateral_oophorectomy))` patients received a bilateral oophorectomy only, and `r length(which(censor_surg_unique$hysterectomy & censor_surg_unique$bilateral_oophorectomy))` patients received both. 
+
+```{r}
+censor_surg_unique %>%
+  group_by(censor_surg_date) %>%
+  summarise(count=n_distinct(pat_id), .groups='drop') %>%
+  mutate(cumulative_count = cumsum(count)) %>%
+  ggplot(data=., aes(x=censor_surg_date, y=cumulative_count, label=cumulative_count)) +
+  geom_line() +
+  ylab('Cumulative Count of Surgically-Censored Patients') +
+  xlab('Date of Surgery') +
+  theme_bw()
+```
+
+**NEXT STEP**: Some of these are very close to entry into cohort -- if so they will be censored very early, should they be excluded similar to not getting relevant care in the year following entry into cohort? I guess if they did not receive a diagnosis during this time prior to surgery then they just received the procedure for some other reason which is fine. 
+
+### Menopause (aging out)
+
+```{r}
+menopause_unique <- menopause %>%
+  filter(dx_date < '2023-08-01') %>%
+  group_by(pat_id) %>%
+  filter(dx_date == min(dx_date)) %>%
+  arrange(pat_id, dx_date) %>%
+  mutate(menopause_date = as.Date(dx_date, '%Y-%m-%d')) %>%
+  distinct(pat_id, menopause_date)
+```
+
+The total number of patients who have any menopause diagnosis (and therefore would be censored at this point) is n=`r dim(menopause_unique)[1]`. 
+
+```{r}
+age_out <- pat_unique_final %>%
+  select(pat_id, age_20160801) %>%
+  mutate(ageout_date = as.Date('2016-08-01') %m+% years(55-age_20160801)) %>%
+  mutate(ageout_date = case_when(ageout_date > '2023-10-01'~NA, 
+                                 TRUE~ageout_date))
+```
+
+The total number of patients who age out of the cohort during follow-up (55 or older) is n=`r length(which(!is.na(age_out$ageout_date)))`.
+
+### {.unnumbered}
+
+## Baseline covariates available in this data {.tabset}
+### Healthcare Utilization at baseline and throughout follow-up
+
+```{r hcu_baseline}
+hcu <- pat_unique %>%
+  filter(pat_id %in% pat_unique_final$pat_id) %>%
+  rename(hcu_baseline = num_enc_index_yr)
+```
+
+```{r hcu_fu}
+hcu <- all_enc %>%
+  filter(enc_date > index_enc_date & enc_date <= '2023-08-01') %>% # until end of follow-up
+  mutate(enc_year = year(enc_date)) %>%
+  group_by(pat_id, enc_year) %>%
+  summarise(hcu_per_year = n_distinct(pat_enc_csn_id), .groups='drop') %>%
+  group_by(pat_id) %>%
+  summarise(hcu_fu = mean(hcu_per_year), .groups='drop') %>%
+  full_join(hcu, by='pat_id')
+```
+
+```{r hcu_baseline_summary}
+print(CreateTableOne(data=hcu, vars=c('hcu_baseline', 'hcu_fu')), nonnormal = c('hcu_baseline', 'hcu_fu'))
+```
+
+### Site
+
+I will attribute site in two ways (1) the most common site in the first year of baseline and (2) most common site throughout follow-up. 
+
+The goal here is to know out of Tisch, Brooklyn, FHC and Long Island, which site is the most popular for a given patient. Despite this, most patients will predominantly seek care at outpatient clinics, but we are interested in which hospital would service them if they are to go to a hospital. Therefore as long as they have any visits to a hospital site, we will use this as their most common site. If all of their visits were to outpatient clinics, then they will be assigned 'OTHER'. 
+
+```{r explore_outpatient_sites, eval=FALSE}
+# investigate location names
+
+## Tisch
+table(enc_ip_op$loc_name[which(grepl('tisch|kimmel|lennox|trinity', tolower(enc_ip_op$loc_name)))])
+table(enc_ip_op$dep_external_name[which(grepl('tisch|kimmel|lennox|trinity', tolower(enc_ip_op$dep_external_name)))])
+
+## Brooklyn
+table(enc_ip_op$loc_name[which(grepl('brooklyn|sunset', tolower(enc_ip_op$loc_name)) & 
+                                !grepl('associate|height', tolower(enc_ip_op$loc_name)))])
+table(enc_ip_op$dep_external_name[which(grepl('brooklyn|sunset', tolower(enc_ip_op$dep_external_name)) &
+                                          !grepl('associate|height', tolower(enc_ip_op$loc_name)))])
+
+## Long Island
+table(enc_ip_op$loc_name[which(grepl('long island|winthrop', tolower(enc_ip_op$loc_name)) &
+                                 !grepl('affiliates|associate', tolower(enc_ip_op$loc_name)))])
+table(enc_ip_op$loc_name[which(grepl('long island|winthrop', tolower(enc_ip_op$dep_external_name)) &
+                                 !grepl('affiliates|associate', tolower(enc_ip_op$dep_external_name)))])
+
+## Outpatient clinics
+table(enc_ip_op$loc_name[which(grepl('associate|affiliate|group', tolower(enc_ip_op$loc_name)))])
+table(enc_ip_op$dep_external_name[which(grepl('associate|affiliate|group', tolower(enc_ip_op$dep_external_name)))])
+
+## LI community hospital
+table(enc_ip_op$loc_name[which(grepl('long island community hospital', tolower(enc_ip_op$loc_name)))])
+table(enc_ip_op$dep_external_name[which(grepl('long island community hospital', tolower(enc_ip_op$dep_external_name)))])
+```
+
+```{r raw_sites}
+# most common other sites at baseline
+pat_site_baseline <- all_enc %>%
+  filter(pat_id %in% pat_unique_final$pat_id & enc_date <= '2018-12-31') %>% 
+  count(pat_id, loc_name) %>%
+  group_by(pat_id) %>%
+  slice(which.max(n)) %>%
+  ungroup()
+
+# most common other sites at FU
+pat_site_fu <- all_enc %>%
+  filter(pat_id %in% pat_unique_final$pat_id & enc_date >= '2018-12-31' & enc_date <= '2023-08-01') %>% 
+  count(pat_id, loc_name) %>%
+  group_by(pat_id) %>%
+  slice(which.max(n)) %>%
+  ungroup()
+
+site_baseline_raw <- pat_site_baseline %>%
+  group_by(loc_name) %>%
+  summarise(count=n(), .groups='drop') %>%
+  arrange(desc(count))
+```
+
+```{r missing_site_check, eval=FALSE}
+all_enc %>%
+  filter(pat_id %in% pat_unique_final$pat_id) %>%
+  filter(!pat_id %in% pat_site_baseline$pat_id) %>%
+  arrange(pat_id, enc_date)
+
+# baseline site -- all RN or IM
+pat_unique_final %>% 
+  filter(!pat_id %in% pat_site_baseline$pat_id) %>%
+  left_join(pat_cohort %>% distinct(pat_id, pat_mrn_id), by='pat_id')
+
+# fu site -- way more heterogeneous can't make clean assumption 
+pat_unique_final %>% 
+  filter(!pat_id %in% pat_site_fu$pat_id) %>%
+  left_join(pat_cohort %>% distinct(pat_id, pat_mrn_id), by='pat_id')
+```
+
+There is a weird subset of patients who are n=66 patients whose baseline encounters cannot be found in the encounter table. After doing a thorough investigation of the code, data, and the patient charts of a subset of these. All the encounters missing appear to be Infusion visits at Tisch. These patients all have Registered Nurse for these visits but they are, for some reason (I believe due to the line `pat_enc_hsp.adt_pat_class_c = '101'` in the table2_enc_ip_op code which does not exist in the table1_sup_pat_care code). Because their baseline encounters cannot be found, I will set all of their primary encounter sites at baseline to Tisch (an assumption based on the subset I looked at).
+
+```{r site_rollup}
+## code site based on groupings
+pat_site_baseline <- pat_site_baseline %>%
+  mutate(loc_name = enc2utf8(loc_name)) %>%
+  left_join(site_map %>% rename(site_baseline = site), by='loc_name') %>%
+  mutate(site_baseline = ifelse(grepl("NYU WOMEN'S", loc_name), 'Manhattan OP', site_baseline)) %>%
+  mutate(site_baseline = ifelse(grepl("NYU PEDIATRIC ONCOLOGY", loc_name), 'Tisch/Manhattan Inpatient', site_baseline)) %>%
+  mutate(site_baseline = ifelse(grepl("WASHINGTON SQUARE", loc_name, useBytes = TRUE), 'Manhattan OP', site_baseline))
+
+pat_site_fu <- pat_site_fu %>%
+  mutate(loc_name = enc2utf8(loc_name)) %>%
+  left_join(site_map %>% rename(site_fu = site), by='loc_name') %>%
+  mutate(site_fu = ifelse(grepl("NYU WOMEN'S", loc_name), 'Manhattan OP', site_fu)) %>%
+  mutate(site_fu = ifelse(grepl("NYU PEDIATRIC ONCOLOGY", loc_name), 'Tisch/Manhattan Inpatient', site_fu)) %>%
+  mutate(site_fu = ifelse(grepl("WASHINGTON SQUARE", loc_name, useBytes = TRUE), 'Manhattan OP', site_fu))
+
+# for those missing a site (likely because its other) allow it to be other (but priority is for a site if it exists)
+site_final <- pat_unique_final %>%
+  select(pat_id) %>%
+  left_join(pat_site_baseline %>% select(pat_id, site_baseline), by = 'pat_id') %>%
+  left_join(pat_site_fu %>% select(pat_id, site_fu), by = 'pat_id') %>%
+  mutate(site_baseline = ifelse(is.na(site_baseline), 'Tisch/Manhattan Inpatient', site_baseline))
+```
+
+```{r site_table}
+CreateTableOne(data=site_final %>% filter(site_baseline != 'FLORIDA' & site_fu != 'FLORIDA'), 
+               vars=c('site_baseline', 'site_fu'), includeNA=TRUE)
+```
+
+```{r site_sankey, warning=FALSE, out.width='100%'}
+site_final %>%
+  filter(site_baseline != 'FLORIDA' & site_fu != 'FLORIDA') %>%
+  count(site_baseline, site_fu) %>%
+  mutate(percent = (n/dim(pat_unique_final)[1])*100) %>%
+  arrange(site_baseline, desc(percent)) %>%
+  ggplot(data = .,
+       aes(axis1 = site_baseline,   # First variable on the X-axis
+           axis2 = site_fu, # Second variable on the X-axis
+           y = percent)) +
+  geom_alluvium(aes(fill = site_baseline)) +
+  geom_stratum() +
+  geom_text(stat = "stratum", aes(label = after_stat(stratum))) +
+  theme_void() + 
+  theme(legend.position = 'bottom')
+```
+
+### Insurance at baseline
+
+```{r clean_insur}
+insur_baseline_unique <- insur_baseline %>%
+  mutate(across(where(is.character), ~na_if(., "NULL"))) %>%
+  mutate(pat_enc_csn_id = as.character(pat_enc_csn_id),
+         enc_date = as.Date(enc_date, '%Y-%m-%d')) %>%
+  inner_join(pat_unique_final %>% select(pat_id, all_pat_enc_csn_id, index_enc_date), 
+             by=c('pat_id'='pat_id', 'enc_date'='index_enc_date'))
+```
+
+```{r map_insur}
+public_plans <- 'medicare|medicaid|family health|veteran|champva|healthy new york|child health|essential|healthfirst|metroplus|mcd|1199'
+
+insur_clean <- insur_baseline_unique %>%
+  filter(!is.na(benefit_plan_name)) %>%
+  mutate(insur_status = case_when(grepl(public_plans, tolower(benefit_plan_name))~'public',
+                                  TRUE~'private')) %>%
+  distinct(pat_id, enc_date, payor_name, benefit_plan_name, insur_status, .keep_all = TRUE)
+
+insur_clean_unique <- insur_clean %>%
+  distinct(pat_id, enc_date, insur_status)
+```
+
+```{r missing_insur}
+# are there other relevant encounters for these patients in the baseline year
+other_baseline_insur <- all_enc %>% 
+  filter(enc_date < '2017-12-31' & enc_date != index_enc_date) %>%
+  filter(pat_id %in% pat_unique_final$pat_id & !pat_id %in% insur_clean$pat_id) %>%
+  mutate(margin = difftime(index_enc_date, enc_date, units='days')) %>%
+  filter(margin <= 365) %>%
+  group_by(pat_id) %>%
+  filter(abs(margin) == min(abs(margin))) %>%
+  left_join(enc_ip_op %>% distinct(pat_id, pat_enc_csn_id, payor_name, benefit_plan_name), by=c('pat_id', 'pat_enc_csn_id'))
+
+other_baseline_insur <- other_baseline_insur %>%
+  mutate(across(where(is.character), ~na_if(., "NULL"))) %>%
+  filter(!is.na(benefit_plan_name)) %>%
+  mutate(insur_status = case_when(grepl(public_plans, tolower(benefit_plan_name))~'public',
+                                  TRUE~'private')) %>%
+  select(pat_id, pat_enc_csn_id, enc_date, enc_type, loc_name, margin, benefit_plan_name, insur_status)
+
+#length(unique(other_baseline_insur$pat_id)) ## we can find another baseline encounter for 907 patients
+
+#length(which(!is.na(other_baseline_insur$insur_status))) ## 1089 are no longer missing at closest relevant encounter to index encounter
+```
+
+```{r fill_in_missing_insur}
+insur_final <- pat_unique_final %>% 
+  select(pat_id) %>%
+  left_join(insur_clean_unique %>% select(-enc_date), by = 'pat_id') %>%
+  left_join(other_baseline_insur %>% 
+              distinct(pat_id, insur_status) %>% 
+              filter(!is.na(insur_status)) %>%
+              rename(insur_status_filled = insur_status), 
+            by='pat_id') %>%
+  mutate(insur_status_filled = ifelse(!is.na(insur_status), insur_status, insur_status_filled))
+```
+
+### {.unnumbered}
+
+## Join together all dates of potential censoring/LTFU
+
+```{r}
+pat_unique_final <- pat_unique_final %>%
+  rename(hcu_baseline = num_enc_index_yr) %>%
+  left_join(ltfu_unique %>% select(pat_id, contains('ltfu')), by='pat_id') %>%
+  left_join(censor_surg_unique %>% select(pat_id, censor_surg_date), by='pat_id') %>%
+  left_join(menopause_unique, by='pat_id') %>%
+  left_join(age_out %>% select(pat_id, ageout_date), by='pat_id') %>%
+  left_join(hcu %>% select(pat_id, hcu_fu), by='pat_id') %>%
+  left_join(site_final, by='pat_id') %>%
+  left_join(insur_final, by='pat_id') %>%
+  filter()
+
+summary(pat_unique_final)
+```
+
+```{r}
+# create final censoring variables
+pat_unique_final <- pat_unique_final %>%
+  mutate(death_date_fu = case_when(death_date<='2023-08-01'~death_date, TRUE~NA)) %>% 
+  mutate(final_censor_date = pmin(death_date_fu, ltfu_date, censor_surg_date, 
+                                  menopause_date, ageout_date, na.rm = TRUE)) %>%
+  mutate(final_censor_type = case_when(final_censor_date == death_date_fu~'Death',
+                                       final_censor_date == censor_surg_date~'Surgery',
+                                       final_censor_date == menopause_date~'Menopause',
+                                       final_censor_date == ageout_date~'Aged out',
+                                       final_censor_date == ltfu_date & 
+                                         ltfu_status == 'complete'~'LTFU',
+                                       TRUE~NA))
+```
+
+Distribution of first censoring event in entire cohort: (excluding due to disease diagnosis)
+```{r}
+pat_unique_final %>%
+  filter(!is.na(final_censor_type)) %>%
+  CreateTableOne(data=., vars='final_censor_type')
+```
+
+```{r}
+n_total <- length(unique(pat_unique_final$pat_id))
+
+pat_unique_final %>%
+  group_by(final_censor_date) %>%
+  summarise(count=n(), .groups='drop') %>%
+  mutate(cumulative_count = n_total - cumsum(count)) %>%
+  ggplot(data=., aes(x=final_censor_date, y=cumulative_count)) +
+  geom_line() +
+  ylab('Cumulative Count of Patients Uncensored') +
+  xlab('Date of Censoring') +
+  theme_bw()
+```
+
+```{r output}
+## add mrn to the file
+pat_unique_final <- pat_unique_final %>%
+  left_join(pat_cohort %>%
+              filter(pat_id %in% pat_unique_final$pat_id) %>%
+              distinct(pat_id, pat_mrn_id), by = 'pat_id')
+
+## write out file with date and reason for LTFU or censoring during follow-up for all patients
+write.csv(pat_unique_final, 'Data/Derived/pat_cohort_w_censoring.csv', row.names=FALSE)
+## some may be retrospectively overwritten if they are diagnosed with UF or Endo before that point
+```
+
+```{r, eval=FALSE, include=FALSE, echo=FALSE}
+### EVERYTHING BELOW THIS IS ARCHIVED CODE
+
+# look at average length to next visit for all patients
+time_to_first_FU <- bind_rows(ed_FU_all, ip_op_FU_all) %>%
+  mutate(FU_margin = difftime(enc_date, index_enc_date, units='days')) %>%
+  group_by(pat_id) %>%
+  filter(FU_margin == min(FU_margin)) %>%
+  ungroup() %>%
+  distinct(pat_id, FU_margin, provider_specialty)
+```
+
+```{r, eval=FALSE, include=FALSE, echo=FALSE, fig.cap='Regularity of relevant care among eligible patients'}
+# plot the distribution
+time_to_first_FU %>%
+  ggplot(aes(x=as.numeric(FU_margin))) +
+  geom_histogram(bins=60, fill='gray', color='black') +
+  geom_vline(xintercept=365, color='orange') +
+  geom_vline(xintercept=730, color='red') +
+  xlab('Time from index encounter to next relevant care encounter') +
+  ylab('Count of patients') +
+  theme_bw()
+
+#The orange line indicates one year from index encounter to next relevant care encounter. The red line indicates two years. 
+
+#`r length(unique(time_to_first_FU$pat_id))` patients ever re-engage in relevant care in following their index encounter. The average length to next encounter is `r round(mean(as.numeric(time_to_first_FU$FU_margin))/365, 2)` years. The maximum length to next encounter is `r round(max(as.numeric(time_to_first_FU$FU_margin))/365, 2)` years. 
+
+#The final number of patients who have relevant care past Dec 2018 (one year from the latest possible index encounter) is n=`r length(which(time_to_first_FU$FU_margin <= 730))` (`r round(length(which(time_to_first_FU$FU_margin <= 730))/dim(time_to_first_FU)[1], 2)*100`% of eligible patients). These are the patients who can truly be followed for potential diagnosis since they maintain care in the first two years of follow-up. Other patients we consider not regular and therefore not at risk of diagnosis. 
+```
+
+```{r, eval=FALSE, include=FALSE, echo=FALSE}
+time_to_first_FU %>%
+  mutate(`OBGYN general` = case_when(grepl(paste(obgyn_care,collapse="|"),
+                                      toupper(provider_specialty))~TRUE,TRUE~FALSE),
+         Gynecology = case_when(grepl(paste(gyn_care,collapse="|"),
+                                      toupper(provider_specialty))~TRUE,TRUE~FALSE),
+         Obstetrics = case_when(grepl(paste(ob_care,collapse="|"),
+                                     toupper(provider_specialty))~TRUE,TRUE~FALSE),
+         `General Care` = case_when(grepl(paste(general_care,collapse="|"),
+                                        toupper(provider_specialty))~TRUE,TRUE~FALSE),
+         Endocrinology = case_when(grepl(paste(endocrine_care,collapse="|"),
+                                         toupper(provider_specialty))~TRUE,TRUE~FALSE),
+         `Emergency Care` = case_when(grepl(paste(ed_care,collapse="|"),
+                                         toupper(provider_specialty))~TRUE,TRUE~FALSE))%>%
+  CreateCatTable(data=., vars=c('OBGYN general', 'Gynecology', 'Obstetrics', 
+                                'General Care', 'Endocrinology', 'Emergency Care'))
+
+#The first follow-up care types are all similar percentages to the index encounter type. This could indicate consistent care from one encounter to the next for the same patient or overall consistency of care types among eligible patients. 
+```
