@@ -1,0 +1,1073 @@
+---
+title: "Validation Analysis"
+author: "Mia Charifson"
+date: "2024-06-03"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+knitr::opts_knit$set(root.dir = '/Users/miacharifson/Library/CloudStorage/OneDrive-NYULangoneHealth/Charifson Dissertation/')
+
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+library(arsenal)
+library(yardstick)
+library(kableExtra)
+library(tableone)
+library(corrplot)
+library(gridExtra)
+library(psych)
+library(caret)
+library(ggpubr)
+```
+
+Last updated on: `r today()`.
+
+# Background
+
+This document performs the analysis for the chart review validation study of identifying incident UF and Endo from EHR.
+
+The final analysis will produce positive predictive value, sensitivity, specificity and negative predictive value for three methods of defining cases: 
+
+1. ICD code only
+2. ICD code plus diagnostic procedure (within 6 months)
+3. Our algorithm
+
+There are also special investigations into hesitant cases, potential false negatives and patients with both conditions. 
+
+According to the SDAVV method: 
+
+```{r}
+## SDAVV method for sample size
+expected <- 0.8
+lower <- 0.7
+
+n <- round(((1.96^2)*expected*(1-expected))/((expected-lower)^2), 2)
+print(paste('We need at least n=', n, 'patients randomly selected from each group to review, for a expected PPV/NPV of', expected, 'and a critical lower bound of', lower))
+```
+
+
+# Cleaning the data
+
+```{r load}
+redcap_df <- read.csv('Data/Derived/Chart Review/export_data_20240619.csv')
+second_review <- read.csv('Data/Derived/Chart Review/export_secondary_review_20240620.csv')
+chart_info <- read.csv('Data/Derived/Chart Review/all_chart_cases_w_info.csv')
+uf_cohort <- read.csv('Data/Derived/uf_all_hints.csv')
+endo_cohort <- read.csv('Data/Derived/endo_all_hints.csv')
+false_negatives <- read.csv('Data/Derived/putative_false_negatives.csv')
+pat_cohort <- read.csv('Data/Derived/pat_cohort_w_censoring.csv')
+adeno <- read.csv('Data/Derived/clean_covariates.csv') %>% select(pat_id, contains('adeno'))
+```
+
+```{r}
+chart_info <- chart_info %>% mutate(condition = ifelse(is.na(condition), 'None', condition))
+redcap_df <- redcap_df %>% filter(redcap_event_name != 'secondary_review_arm_7')
+false_neg_ids <- false_negatives$pat_id[which(!false_negatives$ever_imaging & !false_negatives$ever_surgery)]
+```
+
+Cleaning the data from EHR:
+```{r mk_alg_df}
+uf_final <- uf_cohort %>% 
+  # redo endo definition without referral & prevalent dx
+  mutate(confident_incident = case_when(confident_prevalent~FALSE,
+                                        ever_confirmed_6months | any_location |
+                                          #multiple_referral | prevalent_dx_after_proc |
+                                          ever_pregnancy_related | dx_after_partial_LTFU~TRUE,
+                                        TRUE~FALSE)) %>%
+  select(pat_id, confident_incident, confident_prevalent, first_dx_date, first_confirm_date, 
+         first_confirm_type, first_location_date, imaging_confirmed, surgery_confirmed) %>%
+  mutate(icd_confirmed = TRUE,
+         algorithm = case_when(confident_incident~'Incident', !confident_incident~'Prevalent')) %>%
+  rename_at(vars(confident_incident:algorithm), ~paste0("uf_", .))
+
+endo_final <- endo_cohort %>% 
+  # add Adeno information to try to identify false positives
+  left_join(adeno, by='pat_id') %>%
+  # redo endo definition without referral & prevalent dx
+  mutate(false_positive = first_dx_type == 'Hospital Account Diagnosis' & dx_count <= 2 & adeno_final=='Yes',
+         confident_incident = case_when(false_positive | confident_prevalent~FALSE,
+                                        ever_confirmed_6months | any_location |
+                                          #multiple_referral | prevalent_dx_after_proc |
+                                          dx_via_laparoscopy | dx_after_partial_LTFU~TRUE,
+                                        TRUE~FALSE)) %>%
+  select(pat_id, confident_incident, confident_prevalent, first_dx_date, first_confirm_date, 
+         first_confirm_type, first_location_date, imaging_confirmed, surgery_confirmed, false_positive) %>%
+  mutate(icd_confirmed = TRUE,
+         algorithm = case_when(false_positive~'No Dx',
+                               confident_incident~'Incident', 
+                               !confident_incident~'Prevalent')) %>%
+  rename_at(vars(confident_incident:algorithm), ~paste0("endo_", .))
+
+pred_df_all <- pat_cohort %>% 
+  select(pat_mrn_id, pat_id, index_enc_date) %>% rename(mrn=pat_mrn_id) %>%
+  left_join(uf_final, by='pat_id') %>%
+  left_join(endo_final, by='pat_id') %>%
+  # fill in NA for rest of cohort
+  mutate_at(vars(uf_confident_incident, uf_imaging_confirmed:uf_icd_confirmed), ~ifelse(is.na(.), FALSE, .)) %>%
+  mutate_at(vars(endo_confident_incident, endo_imaging_confirmed:endo_icd_confirmed), ~ifelse(is.na(.), FALSE,
+                                                                                              .)) %>%
+  # make those missing outcome to NA and make final outcome
+  mutate(uf_algorithm = case_when(is.na(uf_algorithm)~'No Dx', TRUE~uf_algorithm),
+         endo_algorithm = case_when(is.na(endo_algorithm)~'No Dx', TRUE~endo_algorithm),
+         uf_first_dx_date = as.Date(uf_first_dx_date), 
+         endo_first_dx_date = as.Date(endo_first_dx_date),
+         final_outcome_status = case_when(uf_algorithm=='Incident' & 
+                                            endo_algorithm=='Incident' ~'Both Incident',
+                                          uf_algorithm=='Incident' & 
+                                            endo_algorithm!='Incident'~'Incident UF only',
+                                          uf_algorithm!='Incident' & 
+                                            endo_algorithm=='Incident'~'Incident Endo only',
+                                          uf_icd_confirmed & uf_algorithm!='Incident'~ 'UF unconfirmed',
+                                          endo_icd_confirmed & endo_algorithm!='Incident'~ 'Endo unconfirmed',
+                                          pat_id %in% false_neg_ids~'Potential false negative',
+                                          TRUE~'Neither incident'),
+         uf_icd_proc_confirmed = case_when(uf_imaging_confirmed | uf_surgery_confirmed~TRUE, TRUE~FALSE),
+         endo_icd_proc_confirmed = case_when(endo_imaging_confirmed | endo_surgery_confirmed~TRUE, TRUE~FALSE),
+         uf_icd_proc_multi = case_when(uf_imaging_confirmed | uf_surgery_confirmed~'Incident', 
+                                        uf_icd_confirmed~'Prevalent', 
+                                        TRUE~'No Dx'),
+         endo_icd_proc_multi = case_when(endo_imaging_confirmed | endo_surgery_confirmed~'Incident', 
+                                          endo_icd_confirmed~'Prevalent', 
+                                          TRUE~'No Dx'))
+
+pred_df <- pred_df_all %>% filter(mrn %in% chart_info$mrn)
+```
+
+Cleaning the data from chart review:
+```{r clean_redcap_data}
+true_df_clean <- redcap_df %>% 
+  filter(!mrn %in% second_review$mrn) %>% 
+  bind_rows(second_review %>% mutate(secondary_review_final==1)) %>% 
+  # derive outcome status based on different definitions
+  mutate(uf_clinical_chart = case_when(medical_hx_uf==1|problem_list_uf==1|prior_dx_uf==1~TRUE,TRUE~FALSE),
+         uf_imaging_chart = case_when(imaging_confirmed_uf==1~TRUE,TRUE~FALSE),
+         uf_surgery_chart = case_when(surgery_confirmed_uf==1~TRUE,TRUE~FALSE),
+         uf_any_chart = case_when(uf_clinical_chart==1|uf_imaging_chart==1|uf_surgery_chart==1~TRUE,TRUE~FALSE),
+         endo_clinical_chart = case_when(medical_hx_endo==1|problem_list_endo==1|prior_dx_endo==1~TRUE,TRUE~FALSE),
+         endo_imaging_chart = case_when(imaging_confirmed_endo==1~TRUE,TRUE~FALSE),
+         endo_surgery_chart = case_when(surgery_confirmed_endo==1~TRUE,TRUE~FALSE),
+         endo_any_chart = case_when(endo_clinical_chart==1|endo_imaging_chart==1|endo_surgery_chart==1~TRUE,
+                                    TRUE~FALSE)) %>%
+  # derive earliest dx date from date variables
+  mutate(across((contains('date') | contains('entry')) & !contains('prior_dx_date'), ~as.Date(.,  '%m/%d/%y'))) %>%
+  mutate(prior_dx_date_uf_clean = case_when(
+    grepl('[0-9]{1,2}/[0-9]{1,2}/[0-9]{1,2}', prior_dx_date_uf, perl=TRUE)~as.Date(prior_dx_date_uf, '%m/%d/%y'),
+    grepl('[0-9]{1,2}-[0-9]{1,2}-[0-9]{1,4}', prior_dx_date_uf, perl=TRUE)~as.Date(prior_dx_date_uf, '%m-%d-%Y'),
+    grepl('[0-9]{1,2}/[0-9]{1,2}/[0-9]{4}', prior_dx_date_uf, perl=TRUE)~as.Date(prior_dx_date_uf, '%m/%d/%Y'),
+    grepl('[a-zA-Z]{3}-[0-9]{1,2}', prior_dx_date_uf, perl=TRUE)~
+      as.Date(paste0('01-', prior_dx_date_uf), '%d-%b-%y'),
+    grepl('[0-9]{1,4}', prior_dx_date_uf, perl=TRUE)~as.Date(paste0('01-01-', prior_dx_date_uf), '%m-%d-%Y'),
+    TRUE~NA)) %>%
+  mutate(prior_dx_date_endo_clean = case_when(
+    grepl('[0-9]{1,2}/[0-9]{1,2}/[0-9]{1,2}', prior_dx_date_endo, perl=TRUE)~as.Date(prior_dx_date_endo, '%m/%d/%y'),
+    grepl('[0-9]{1,2}-[0-9]{1,2}-[0-9]{1,4}', prior_dx_date_endo, perl=TRUE)~as.Date(prior_dx_date_endo, '%m-%d-%Y'),
+    grepl('[0-9]{1,2}/[0-9]{1,2}/[0-9]{4}', prior_dx_date_endo, perl=TRUE)~as.Date(prior_dx_date_endo, '%m/%d/%Y'),
+    grepl('[a-zA-Z]{3}-[0-9]{1,2}', prior_dx_date_endo, perl=TRUE)~
+      as.Date(paste0('01-', prior_dx_date_endo), '%d-%b-%y'),
+    grepl('[0-9]{1,4}', prior_dx_date_endo, perl=TRUE)~as.Date(paste0('01-01-', prior_dx_date_endo), '%m-%d-%Y'),
+    TRUE~NA)) %>%
+  mutate(prior_dx_date_endo_clean = as.Date(prior_dx_date_endo_clean),
+         prior_dx_date_uf_clean = as.Date(prior_dx_date_uf_clean)) %>%
+  # determine earliest dx date
+  mutate(uf_earliest_dx_date = pmin(medical_hx_date_uf, problem_list_date_uf, imaging_confirmed_date_uf,
+                                    surgery_confirmed_date_uf, prior_dx_entry_uf, 
+                                    prior_dx_date_uf_clean, na.rm=TRUE),
+         endo_earliest_dx_date = pmin(medical_hx_date_endo, problem_list_date_endo, imaging_confirmed_date_endo,
+                                      surgery_confirmed_date_endo, prior_dx_entry_endo, 
+                                      prior_dx_date_endo_clean, na.rm=TRUE)) %>%
+  # if earliest date is only from note entry then flag
+  mutate(uf_gold_date_flag = case_when(is.na(coalesce(medical_hx_date_uf,problem_list_date_uf,
+                                                      imaging_confirmed_date_uf,surgery_confirmed_date_uf,
+                                                      prior_dx_date_uf_clean)) &
+                                         prior_dx_entry_uf == uf_earliest_dx_date~TRUE, 
+                                       TRUE~FALSE),
+         endo_gold_date_flag = case_when(is.na(coalesce(medical_hx_date_endo,problem_list_date_endo,
+                                                      imaging_confirmed_date_endo,surgery_confirmed_date_endo,
+                                                      prior_dx_date_endo_clean)) &
+                                           prior_dx_entry_endo == endo_earliest_dx_date~TRUE, 
+                                         TRUE~FALSE)) %>%
+  # make final determination for prevalent vs. incident
+  mutate(uf_gold_dx = case_when(uf_any_chart & uf_earliest_dx_date <= '2016-08-01'~'Prevalent',
+                                uf_any_chart & uf_earliest_dx_date > '2016-08-01'~'Incident',
+                                uf_any_chart & is.na(uf_earliest_dx_date)~'Incident',
+                                TRUE~'No Dx'),
+         endo_gold_dx = case_when(endo_any_chart & endo_earliest_dx_date <= '2016-08-01'~'Prevalent',
+                                  endo_any_chart & endo_earliest_dx_date > '2016-08-01'~'Incident',
+                                  endo_any_chart & is.na(endo_earliest_dx_date)~'Incident',
+                                  TRUE~'No Dx')) %>%
+  select(mrn, uf_clinical_chart:endo_gold_dx, contains('date'), contains('entry'), notes_final) %>%
+  distinct()
+```
+
+Manually check the second review cases (n=`r dim(second_review)[1]`):
+```{r, eval=FALSE}
+true_df_clean %>%
+  filter(mrn %in% second_review$mrn) %>%
+  left_join(second_review %>% select(mrn, notes_final), by='mrn') %>%
+  select(mrn, uf_gold_dx, endo_gold_dx, notes_final) %>%
+  View()
+```
+
+```{r clean_secondary}
+remove_incident_uf <- true_df_clean$mrn[which(true_df_clean$mrn %in% second_review$mrn)][c(5,7)]
+true_df_clean$uf_gold_dx[which(true_df_clean$mrn %in% remove_incident_uf)] <- 'No Dx'
+```
+
+Manually check the patients without confirmed dates (UF n=`r length(which(true_df_clean$uf_gold_date_flag))`, Endo n= `r length(which(true_df_clean$endo_gold_date_flag))`):
+```{r, eval=FALSE}
+true_df_clean %>%
+  filter((uf_gold_date_flag) & !is.na(notes_final) & notes_final !='') %>%
+  select(mrn, uf_gold_dx, uf_earliest_dx_date, notes_final) %>%
+  View()
+
+true_df_clean %>%
+  filter((endo_gold_date_flag) & !is.na(notes_final) & notes_final !='') %>%
+  select(mrn, endo_gold_dx, endo_earliest_dx_date, notes_final) %>%
+  View()
+```
+
+```{r clean_missing_dx_date}
+uf_ignore_date_flag <- true_df_clean$mrn[which(true_df_clean$uf_gold_date_flag & 
+                                                 !is.na(true_df_clean$notes_final) & 
+                                                 true_df_clean$notes_final !='')][c(4,6)]
+
+endo_ignore_date_flag <- true_df_clean$mrn[which(true_df_clean$endo_gold_date_flag & 
+                                                 !is.na(true_df_clean$notes_final) & 
+                                                 true_df_clean$notes_final !='')][c(4,8,9,10)]
+
+true_df_clean$uf_gold_date_flag[which(true_df_clean$mrn %in% uf_ignore_date_flag)] <- FALSE
+true_df_clean$endo_gold_date_flag[which(true_df_clean$mrn %in% endo_ignore_date_flag)] <- FALSE
+```
+Now there are only UF n=`r length(which(true_df_clean$uf_gold_date_flag))` and Endo n= `r length(which(true_df_clean$endo_gold_date_flag))` patients with unconfirmed incident status.
+
+Manually check notes for uncertain cases:
+```{r review_notes, eval=FALSE}
+review_notes_flag <- true_df_clean %>% 
+  filter(notes_final!='' & !is.na(notes_final)) %>%
+  select(mrn, uf_gold_dx, uf_gold_date_flag, endo_gold_dx, endo_gold_date_flag, notes_final) %>%
+  mutate(uf_notes_flag = NA, endo_notes_flag = NA)
+
+# copy and print in terminal to get rows printed properly
+for (i in 1:dim(review_notes_flag)[1]) {
+  print(review_notes_flag[i,2:6])
+  review_notes_flag$uf_notes_flag[i] <- readline(prompt ='Flag for uncertainty in UF case status? y/n: ')
+  review_notes_flag$endo_notes_flag[i] <- readline(prompt ='Flag for uncertainty in Endo case status? y/n: ')
+}
+
+write.csv(review_notes_flag, 'Data/Derived/Chart Review/flagged_notes.csv', row.names = FALSE)
+```
+
+```{r}
+review_notes_flag <- read.csv('Data/Derived/Chart Review/flagged_notes.csv')
+print(paste('There are', length(which(review_notes_flag$uf_notes_flag=='y' & !review_notes_flag$uf_gold_date_flag)), 'patients who have an uncertain UF dx from chart review.'))
+
+print(paste('There are', length(which(review_notes_flag$endo_notes_flag=='y' & !review_notes_flag$endo_gold_date_flag)), 'patients who have an uncertain Endo dx from chart review.'))
+```
+
+# Cohort description
+
+```{r}
+# make case statuses
+outcome_tbl <- pred_df_all %>%
+  mutate(uf_icd_outcome_status = case_when(uf_icd_confirmed~'UF confirmed', TRUE~'Control'),
+         endo_icd_outcome_status = case_when(endo_icd_confirmed~'Endo confirmed', TRUE~'Control'),
+         endo_proc_confirmed = endo_imaging_confirmed | endo_surgery_confirmed, 
+         uf_proc_confirmed = uf_imaging_confirmed | uf_surgery_confirmed, 
+         uf_icd_proc_outcome_status = case_when(uf_proc_confirmed~'UF confirmed',
+                                                !uf_proc_confirmed & uf_icd_confirmed~'UF unconfirmed',
+                                                TRUE~'Control'),
+         endo_icd_proc_outcome_status = case_when(endo_proc_confirmed~'Endo confirmed',
+                                                  !endo_proc_confirmed & endo_icd_confirmed~'Endo unconfirmed',
+                                                  TRUE~'Control'),
+         uf_icd_diag_outcome_status = case_when(uf_algorithm=='Incident' ~'UF confirmed',
+                                                uf_algorithm=='Prevalent'~ 'UF unconfirmed',
+                                                TRUE~'Control'),
+         endo_icd_diag_outcome_status = case_when(endo_algorithm=='Incident' ~'Endo confirmed',
+                                                  endo_algorithm=='Prevalent'~ 'Endo unconfirmed',
+                                                  TRUE~'Control'),
+         both_icd = uf_icd_confirmed & endo_icd_confirmed,
+         both_icd_proc = uf_proc_confirmed & endo_proc_confirmed,
+         both_icd_diag = uf_algorithm=='Incident' & endo_algorithm=='Incident',
+         false_negative = pat_id %in% false_neg_ids) %>%
+  mutate(across(uf_icd_outcome_status:false_negative, ~factor(.))) %>%
+  select(mrn, uf_icd_outcome_status:false_negative) %>%
+  left_join(true_df_clean %>% select(mrn, contains('gold_date_flag')), by='mrn')
+```
+
+Uterine Fibroid Classification
+```{r}
+outcome_tbl %>% 
+  select(mrn, uf_icd_outcome_status, uf_icd_diag_outcome_status, uf_icd_proc_outcome_status) %>%
+  pivot_longer(cols=uf_icd_outcome_status:uf_icd_proc_outcome_status, names_to = 'approach', values_to = 'outcome',
+               names_pattern = "uf_(.*)_outcome_status") %>%
+  mutate(approach = factor(approach, levels = c('icd', 'icd_proc', 'icd_diag')),
+         outcome = factor(outcome, levels = c('UF confirmed', 'UF unconfirmed', 'Control'))) %>%
+  CreateTableOne(var='outcome', strata='approach', data=., test=FALSE)
+```
+
+Endometriosis Classification
+```{r}
+outcome_tbl %>% 
+  select(mrn, endo_icd_outcome_status, endo_icd_diag_outcome_status, endo_icd_proc_outcome_status) %>%
+  pivot_longer(cols=endo_icd_outcome_status:endo_icd_proc_outcome_status, names_to = 'approach', 
+               values_to = 'outcome', names_pattern = "endo_(.*)_outcome_status") %>%
+  mutate(approach = factor(approach, levels = c('icd', 'icd_proc', 'icd_diag')),
+         outcome = factor(outcome, levels = c('Endo confirmed', 'Endo unconfirmed', 'Control'))) %>%
+  CreateTableOne(var='outcome', strata='approach', data=., test=FALSE)
+```
+
+Uterine Fibroid Chart review
+```{r}
+outcome_tbl %>% 
+  filter(mrn %in% pred_df$mrn & false_negative==FALSE & endo_icd_outcome_status=='Control' & !uf_gold_date_flag) %>%
+  select(mrn, uf_icd_outcome_status, uf_icd_diag_outcome_status, uf_icd_proc_outcome_status) %>%
+  pivot_longer(cols=uf_icd_outcome_status:uf_icd_proc_outcome_status, names_to = 'approach', values_to = 'outcome',
+               names_pattern = "uf_(.*)_outcome_status") %>%
+  mutate(approach = factor(approach, levels = c('icd', 'icd_proc', 'icd_diag')),
+         outcome = factor(outcome, levels = c('UF confirmed', 'UF unconfirmed', 'Control'))) %>%
+  CreateTableOne(var='outcome', strata='approach', data=., test=FALSE)
+```
+
+Endometriosis Chart review
+```{r}
+outcome_tbl %>% 
+  filter(mrn %in% pred_df$mrn & false_negative==FALSE & uf_icd_outcome_status=='Control' & !endo_gold_date_flag) %>%
+  select(mrn, endo_icd_outcome_status, endo_icd_diag_outcome_status, endo_icd_proc_outcome_status) %>%
+  pivot_longer(cols=endo_icd_outcome_status:endo_icd_proc_outcome_status, names_to = 'approach', 
+               values_to = 'outcome', names_pattern = "endo_(.*)_outcome_status") %>%
+  mutate(approach = factor(approach, levels = c('icd', 'icd_proc', 'icd_diag')),
+         outcome = factor(outcome, levels = c('Endo confirmed', 'Endo unconfirmed', 'Control'))) %>%
+  CreateTableOne(var='outcome', strata='approach', data=., test=FALSE)
+```
+
+# Main validation 
+
+```{r func1}
+# ids = list of ids to validate on
+# chart_case = variable name which counts as a true case from chart review for this validation
+# ehr_case = variable name which counts as a true case from EHR algorithm for this validation
+validate_cases <- function(ids, chart_case, ehr_case) {
+  df <- true_df_clean %>%
+    filter(mrn %in% ids) %>%
+    left_join(pred_df, by='mrn') %>%
+    select(contains(chart_case), contains(ehr_case)) %>%
+    mutate_all(~factor(.))
+  colnames(df) <- c('chart_case', 'ehr_case')
+  if(length(levels(df$chart_case))==2) {
+    df$chart_case <- factor(df$chart_case, levels=c('TRUE', 'FALSE'), labels=c('Case', 'No Dx'))
+  }
+  if(length(levels(df$chart_case))==2) {
+    df$ehr_case <- factor(df$ehr_case, levels=c('TRUE', 'FALSE'), labels=c('Case', 'No Dx'))
+  }
+  return(df)
+}
+```
+
+```{r func2}
+weights_bin <- pred_df_all %>%
+  select(uf_icd_confirmed, uf_icd_proc_confirmed, uf_confident_incident, 
+         endo_icd_confirmed, endo_icd_proc_confirmed, endo_confident_incident) %>%
+  mutate(across(uf_icd_confirmed:endo_confident_incident, ~factor(., labels=c('No Dx', 'Case')))) %>%
+  rename(uf_icd = uf_icd_confirmed, uf_icd_proc = uf_icd_proc_confirmed, uf_icd_diag = uf_confident_incident,
+         endo_icd = endo_icd_confirmed,endo_icd_proc = endo_icd_proc_confirmed,endo_icd_diag = endo_confident_incident) %>%
+  pivot_longer(cols=uf_icd:endo_icd_diag, names_to="approach", values_to = "class") %>%
+  group_by(approach, class) %>%
+  summarise(weight = n()/dim(pred_df_all)[1], .groups='drop')
+
+weights_multi <- pred_df_all %>%
+  mutate(uf_icd = factor(uf_icd_confirmed, labels=c('No Dx', 'Incident')),
+         endo_icd = factor(endo_icd_confirmed, labels=c('No Dx', 'Incident'))) %>%
+  select(uf_icd, uf_icd_proc_multi, uf_algorithm, endo_icd, endo_icd_proc_multi, endo_algorithm) %>%
+  rename(uf_icd_proc = uf_icd_proc_multi, uf_icd_diag = uf_algorithm,
+         endo_icd_proc = endo_icd_proc_multi, endo_icd_diag = endo_algorithm) %>%
+  pivot_longer(cols=uf_icd:endo_icd_diag, names_to="approach", values_to = "class") %>%
+  group_by(approach, class) %>%
+  summarise(weight = n()/dim(pred_df_all)[1], .groups='drop') %>%
+  add_row(approach = 'uf_icd', class='Prevalent', weight = 0, .before=11) %>%
+  add_row(approach = 'endo_icd', class='Prevalent', weight = 0, .before=3)
+
+weights_multi %>% 
+  mutate(class = factor(class, levels=c('Incident', 'Prevalent', 'No Dx')))
+
+ppv_npv_ci <- function(val, n) {
+  se <- sqrt((val*(1-val))/n)
+  return(paste0("(", round(val-(1.96*se), 2), ", " , round(val+(1.96*se), 2), ")"))
+}
+
+sens_spec_formula <- function(type, ppv, npv, weight){
+  if(type == 'sens') {
+    out <- (ppv*weight)/((ppv*weight)+((1-npv)*(1-weight)))
+  }
+  if(type == 'spec') {
+    out <- (npv*(1-weight))/((npv*(1-weight))+((1-ppv)*weight))
+  }
+  return(out)
+}
+
+performance_stats <- function(df, approach, type) {
+  if (type == 'binary') {
+    # make table
+    perform_df <- tibble(approach = character(), ppv = numeric(), ppv_ci = character(), npv = numeric(), 
+                         npv_ci = character(), tpr = numeric(), tnr = numeric())
+    # grab weight
+    w <- weights_bin$weight[which(weights_bin$class=="Case" & weights_bin$approach == approach)]
+    ppv <- ppv(df, chart_case, ehr_case)$.estimate
+    npv <- npv(df, chart_case, ehr_case)$.estimate
+    ppv_ci <- ci_formula(ppv, length(which(df$ehr_case == 'Case')))
+    npv_ci <- ci_formula(npv, length(which(df$ehr_case != 'Case')))
+    tpr <- sens_spec_formula("sens", ppv, npv, w)
+    tnr <- sens_spec_formula("spec", ppv, npv, w)
+    perform_df <- perform_df %>% add_row(approach=approach, ppv=ppv, ppv_ci=ppv_ci, npv=npv, 
+                                         npv_ci = npv_ci, tpr=tpr, tnr=tnr)
+  }
+  if (type == 'multi') {
+    # make table
+    perform_df <- tibble(class = character(), ppv = numeric(), ppv_ci = character(), 
+                       npv = numeric(), npv_ci = character(),
+                       tpr = numeric(), tnr = numeric())
+    classes <- c('Incident', 'Prevalent', 'No Dx')
+    cm <- confusionMatrix(df$ehr_case, reference = df$chart_case)
+    class_perform <- as.data.frame(cm$byClass)
+    for (i in 1:length(classes)) {
+      w <- weights_multi$weight[which(weights_multi$class==classes[i] & weights_multi$approach == approach)]
+      ppv <- class_perform$`Pos Pred Value`[i]
+      npv <- class_perform$`Neg Pred Value`[i]
+      ppv_ci <- ci_formula(ppv, length(which(df$ehr_case == classes[i])))
+      npv_ci <- ci_formula(npv, length(which(df$ehr_case != classes[i])))
+      tpr <- sens_spec_formula("sens", ppv, npv, w)
+      tnr <- sens_spec_formula("spec", ppv, npv, w)
+      perform_df <- perform_df %>% add_row(class = classes[i], ppv=ppv, ppv_ci=ppv_ci, npv=npv, npv_ci = npv_ci,
+                                         tpr=tpr, tnr=tnr)
+    }
+    # add overall row
+    perform_df <- perform_df %>% add_row(class = "Overall", ppv=ppv(df, chart_case, ehr_case)$.estimate, ppv_ci=NA, 
+                                         npv=npv(df, chart_case, ehr_case)$.estimate, npv_ci = NA, tpr=NA, tnr=NA)
+  }
+  # print table
+  return(perform_df)
+}
+```
+
+To run the validation statistics, I need to create a 'truth' column from the validation (`chart_case`) and an 'estimated' column from the algorithm (`ehr_case`). I will need to do this for each method and for the case status alone (case vs. no dx) as well as case + incidence (incident case vs. prevalent case vs. no dx) 
+
+Using multiclass classification (`macro` method), we can keep the prevalent cases in the data and still calcualte the relative TPR, TNR, PPV and NPV for each class respectively. See more in depth description [here](https://towardsdatascience.com/multi-class-classification-extracting-performance-metrics-from-the-confusion-matrix-b379b427a872).
+
+```{r}
+t <- outcome_tbl %>% 
+  filter(mrn %in% pred_df$mrn) %>%
+  left_join(review_notes_flag %>% select(mrn, contains('notes_flag')), by='mrn') %>%
+  left_join(chart_info %>% select(mrn, type, condition), by='mrn') %>%
+  filter(condition != 'Both' & type != 'putative false positive') %>%
+  mutate(uf_notes_flag = ifelse(is.na(uf_notes_flag), 'n', uf_notes_flag),
+         endo_notes_flag = ifelse(is.na(endo_notes_flag), 'n', endo_notes_flag),
+         uf_uncertain = ifelse(uf_notes_flag == 'y' | uf_gold_date_flag, TRUE, FALSE),
+         endo_uncertain = ifelse(endo_notes_flag == 'y' | endo_gold_date_flag, TRUE, FALSE))
+
+# putative incident cases + putative controls
+uf_ids <- t$mrn[which(t$condition %in% c("UF", "None") & t$type != 'putative false positive' & !t$uf_uncertain)]
+#pred_df$mrn[which(pred_df$final_outcome_status %in% c('Incident Endo only', 'Endo unconfirmed', 'Neither incident'))]
+
+# putative incident cases + putative controls
+endo_ids <- t$mrn[which(t$condition %in% c("Endo", "None") & t$type != 'putative false positive' & !t$endo_uncertain)]
+#pred_df$mrn[which(pred_df$final_outcome_status %in% c('Incident Endo only', 'Endo unconfirmed', 'Neither incident'))]
+```
+
+## Ability to identify cases
+
+```{r}
+bin_table <- data.frame(Approach=rep(c('ICD only','ICD + diagnostic procedure','ICD + all diagnostic information'),
+                                     each=2), Outcome=rep(c('UF', 'Endo'), 3),
+                        PPV = rep(NA,6), PPV_CI= rep(NA,6), NPV = rep(NA,6), NPV_CI= rep(NA,6), 
+                        TPR = rep(NA,6), TNR = rep(NA,6))
+```
+
+```{r bin_icd}
+# Uterine fibroids
+
+binary_labels <- c('Case (pred)', 'No Dx (pred)', 'Sum')
+# select variables
+df <- validate_cases(uf_ids, 'uf_any_chart', 'uf_icd_confirmed')
+perform_df <- performance_stats(df, type='binary', approach = 'uf_icd')
+# add to bin_table
+bin_table[1, 3:8] <- perform_df[1, 2:7]
+# make confusion matrix
+icd_uf_p1 <- df %>% 
+  group_by(ehr_case, chart_case) %>% 
+  summarise(Y = n(), .groups='drop') %>%
+  ggplot(data=., aes(x = ehr_case, y = chart_case)) +
+  geom_tile(aes(fill = Y), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Y)), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "#009299") +
+  xlab('Predicted class') + ylab('True class') + 
+  theme_bw() + theme(legend.position = "none") +
+  scale_y_discrete(limits = c("No Dx", "Case"), labels=c('Not Incident', 'Incident')) +
+  scale_x_discrete(labels=c('Incident', 'Not Incident')) 
+
+# Endometriosis
+
+# select variables
+df <- validate_cases(endo_ids, 'endo_any_chart', 'endo_icd_confirmed')
+perform_df <- performance_stats(df, type='binary', approach = 'endo_icd')
+# add to bin_table
+bin_table[2, 3:8] <- perform_df[1, 2:7]
+# print confusion matrix
+icd_endo_p1 <- df %>% 
+  group_by(ehr_case, chart_case) %>% 
+  summarise(Y = n(), .groups='drop') %>%
+  add_row(ehr_case = 'No Dx', chart_case = 'Case', Y= 0) %>%
+  ggplot(data=., aes(x = ehr_case, y = chart_case)) +
+  geom_tile(aes(fill = Y), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Y)), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "#009299") +
+  xlab('Predicted class') + ylab('True class') + 
+  theme_bw() + theme(legend.position = "none") +
+  scale_y_discrete(limits = c("No Dx", "Case"), labels=c('Not Incident', 'Incident')) +
+  scale_x_discrete(labels=c('Incident', 'Not Incident')) 
+```
+
+```{r bin_icd_proc}
+# Uterine fibroids
+
+# select variables
+df <- validate_cases(uf_ids, 'uf_any_chart', 'uf_icd_proc_confirmed')
+perform_df <- performance_stats(df, type='binary', approach = 'uf_icd_proc')
+# add to bin_table
+bin_table[3, 3:8] <- perform_df[1, 2:7]
+# print confusion matrix
+icd_proc_uf_p1 <- df %>% 
+  group_by(ehr_case, chart_case) %>% 
+  summarise(Y = n(), .groups='drop') %>%
+  ggplot(data=., aes(x = ehr_case, y = chart_case)) +
+  geom_tile(aes(fill = Y), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Y)), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "#009299") +
+  xlab('Predicted class') + ylab('True class') + 
+  theme_bw() + theme(legend.position = "none") +
+  scale_y_discrete(limits = c("No Dx", "Case"), labels=c('Not Incident', 'Incident')) +
+  scale_x_discrete(labels=c('Incident', 'Not Incident')) 
+
+# Endometriosis
+
+# select variables
+df <- validate_cases(endo_ids, 'endo_any_chart', 'endo_icd_proc_confirmed')
+perform_df <- performance_stats(df, type='binary', approach = 'endo_icd_proc')
+# add to bin_table
+bin_table[4, 3:8] <- perform_df[1, 2:7]
+# print confusion matrix
+icd_proc_endo_p1 <- df %>% 
+  group_by(ehr_case, chart_case) %>% 
+  summarise(Y = n(), .groups='drop') %>%
+  ggplot(data=., aes(x = ehr_case, y = chart_case)) +
+  geom_tile(aes(fill = Y), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Y)), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "#009299") +
+  xlab('Predicted class') + ylab('True class') + 
+  theme_bw() + theme(legend.position = "none") +
+  scale_y_discrete(limits = c("No Dx", "Case"), labels=c('Not Incident', 'Incident')) +
+  scale_x_discrete(labels=c('Incident', 'Not Incident')) 
+```
+
+```{r binary_icd_diag}
+# Uterine fibroids
+
+# select variables
+df <- validate_cases(uf_ids, 'uf_any_chart', 'uf_confident_incident')
+perform_df <- performance_stats(df, type='binary', approach = 'uf_icd_diag')
+# add to bin_table
+bin_table[5, 3:8] <- perform_df[1, 2:7]
+# print confusion matrix
+icd_diag_uf_p1 <- df %>% 
+  group_by(ehr_case, chart_case) %>% 
+  summarise(Y = n(), .groups='drop') %>%
+  ggplot(data=., aes(x = ehr_case, y = chart_case)) +
+  geom_tile(aes(fill = Y), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Y)), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "#009299") +
+  xlab('Predicted class') + ylab('True class') + 
+  theme_bw() + theme(legend.position = "none") +
+  scale_y_discrete(limits = c("No Dx", "Case"), labels=c('Not Incident', 'Incident')) +
+  scale_x_discrete(labels=c('Incident', 'Not Incident')) 
+
+# Endometriosis
+
+# select variables
+df <- validate_cases(endo_ids, 'endo_any_chart', 'endo_confident_incident')
+perform_df <- performance_stats(df, type='binary', approach = 'endo_icd_diag')
+# add to bin_table
+bin_table[6, 3:8] <- perform_df[1, 2:7]
+# print confusion matrix
+icd_diag_endo_p1 <- df %>% 
+  group_by(ehr_case, chart_case) %>% 
+  summarise(Y = n(), .groups='drop') %>%
+  ggplot(data=., aes(x = ehr_case, y = chart_case)) +
+  geom_tile(aes(fill = Y), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Y)), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "#009299") +
+  xlab('Predicted class') + ylab('True class') + 
+  theme_bw() + theme(legend.position = "none") +
+  scale_y_discrete(limits = c("No Dx", "Case"), labels=c('Not Incident', 'Incident')) +
+  scale_x_discrete(labels=c('Incident', 'Not Incident')) 
+```
+
+```{r, out.width='100%'}
+fig1 <- ggarrange(icd_uf_p1 + rremove("xlab"), icd_proc_uf_p1 + rremove("ylab") + rremove("xlab"), 
+          icd_diag_uf_p1 + rremove("ylab") + rremove("xlab"), icd_endo_p1, 
+          icd_proc_endo_p1 + rremove("ylab"), icd_diag_endo_p1 + rremove("ylab"),
+          nrow=2, ncol=3, labels=c('1a', '2a', '3a', '1b', '2b', '3b'))
+
+pdf("Data/Derived/Chart Review/Figure1_binary_confMat.pdf", width = 11.5, height=7)
+fig1
+dev.off()
+
+fig1
+```
+
+```{r}
+kable(bin_table %>% arrange(desc(Outcome)) %>% select(-Outcome), digits=2) %>%
+  kable_styling() %>%
+  group_rows(start_row=1, end_row=3, group_label = 'Uterine fibroids') %>%
+  group_rows(start_row=4, end_row=6, group_label = 'Endometriosis')
+```
+
+## Ability to identify incident cases {.tabset}
+
+```{r}
+multi_table <- data.frame(Approach=rep(rep(c('ICD alone','ICD + diagnostic procedure',
+                                             'ICD + all diagnostic information'), each=4), 2),
+                          Outcome=rep(c('UF', 'Endo'), each=12), 
+                          Class = rep(c('Incident','Prevalent','No Dx', 'Overall'), 6),
+                        PPV = rep(NA,24), PPV_CI= rep(NA,24), NPV = rep(NA,24), NPV_CI= rep(NA,24), 
+                        TPR = rep(NA,24), TNR = rep(NA,24))
+```
+
+```{r multi_icd}
+# Uterine fibroids
+full_labels <- c('Incident (pred)', 'Prevalent (pred)', 'No Dx (pred)', 'Sum')
+# select variables
+df <- validate_cases(uf_ids, 'uf_gold_dx', 'uf_icd_confirmed')
+# add prevalent level
+df$ehr_case <- factor(df$ehr_case, 
+                      levels=c(levels(df$ehr_case), "Prevalent"),
+                      labels=c('No Dx', 'Incident', 'Prevalent'))
+# reorder both
+df$chart_case <- factor(df$chart_case, levels=c('Incident', 'Prevalent', 'No Dx'))
+df$ehr_case <- factor(df$ehr_case, levels=c('Incident', 'Prevalent', 'No Dx'))
+# get performance
+perform_df <- performance_stats(df, type='multi', approach='uf_icd')
+multi_table[1:4, 4:9] <- perform_df[1:4, 2:7]
+# print confusion matrix
+icd_uf_p2 <- df %>% 
+  group_by(ehr_case, chart_case) %>% 
+  summarise(Y = n(), .groups='drop') %>%
+  add_row(ehr_case = 'Prevalent', chart_case = 'No Dx', Y= 0) %>%
+  add_row(ehr_case = 'Prevalent', chart_case = 'Prevalent', Y= 0) %>%
+  add_row(ehr_case = 'Prevalent', chart_case = 'Incident', Y= 0) %>%
+  ggplot(data=., aes(x = ehr_case, y = chart_case)) +
+  geom_tile(aes(fill = Y), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Y)), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "#009299") +
+  xlab('Predicted class') + ylab('True class') + 
+  theme_bw() + theme(legend.position = "none") +
+  scale_y_discrete(limits = c("No Dx", "Prevalent", "Incident")) +
+  scale_x_discrete(limits = c("Incident", "Prevalent", "No Dx"))
+
+# Endometriosis
+
+# select variables
+df <- validate_cases(endo_ids, 'endo_gold_dx', 'endo_icd_confirmed')
+# add prevalent level
+df$ehr_case <- factor(df$ehr_case, 
+                      levels=c(levels(df$ehr_case), "Prevalent"),
+                      labels=c('No Dx', 'Incident', 'Prevalent'))
+# reorder both
+df$chart_case <- factor(df$chart_case, levels=c('Incident', 'Prevalent', 'No Dx'))
+df$ehr_case <- factor(df$ehr_case, levels=c('Incident', 'Prevalent', 'No Dx'))
+# get performance
+perform_df <- performance_stats(df, type='multi', approach='endo_icd')
+multi_table[13:16, 4:9] <- perform_df[1:4, 2:7]
+# print confusion matrix
+icd_endo_p2 <- df %>% 
+  group_by(ehr_case, chart_case) %>% 
+  summarise(Y = n(), .groups='drop') %>%
+  add_row(ehr_case = 'Prevalent', chart_case = 'No Dx', Y= 0) %>%
+  add_row(ehr_case = 'Prevalent', chart_case = 'Prevalent', Y= 0) %>%
+  add_row(ehr_case = 'Prevalent', chart_case = 'Incident', Y= 0) %>%
+  add_row(ehr_case = 'No Dx', chart_case = 'Incident', Y= 0) %>%
+  add_row(ehr_case = 'No Dx', chart_case = 'Prevalent', Y= 0) %>%
+  ggplot(data=., aes(x = ehr_case, y = chart_case)) +
+  geom_tile(aes(fill = Y), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Y)), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "#009299") +
+  xlab('Predicted class') + ylab('True class') + 
+  theme_bw() + theme(legend.position = "none") +
+  scale_y_discrete(limits = c("No Dx", "Prevalent", "Incident")) +
+  scale_x_discrete(limits = c("Incident", "Prevalent", "No Dx"))
+```
+
+```{r multi_icd_proc}
+# Uterine fibroids
+# select variables
+df <- validate_cases(uf_ids, 'uf_gold_dx', 'uf_icd_proc_multi')
+df$chart_case <- factor(df$chart_case, levels=c('Incident', 'Prevalent', 'No Dx'))
+df$ehr_case <- factor(df$ehr_case, levels=c('Incident', 'Prevalent', 'No Dx'))
+perform_df <- performance_stats(df, type='multi', approach='uf_icd_proc')
+# add to multi_table
+multi_table[5:8, 4:9] <- perform_df[1:4, 2:7]
+# print confusion matrix
+icd_proc_uf_p2 <- df %>% 
+  group_by(ehr_case, chart_case) %>% 
+  summarise(Y = n(), .groups='drop') %>%
+  ggplot(data=., aes(x = ehr_case, y = chart_case)) +
+  geom_tile(aes(fill = Y), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Y)), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "#009299") +
+  xlab('Predicted class') + ylab('True class') + 
+  theme_bw() + theme(legend.position = "none") +
+  scale_y_discrete(limits = c("No Dx", "Prevalent", "Incident")) +
+  scale_x_discrete(limits = c("Incident", "Prevalent", "No Dx"))
+
+# Endometriosis
+
+# select variables
+df <- validate_cases(endo_ids, 'endo_gold_dx', 'endo_icd_proc_multi')
+df$chart_case <- factor(df$chart_case, levels=c('Incident', 'Prevalent', 'No Dx'))
+df$ehr_case <- factor(df$ehr_case, levels=c('Incident', 'Prevalent', 'No Dx'))
+perform_df <- performance_stats(df, type='multi', approach='endo_icd_proc')
+# add to multi_table
+multi_table[17:20, 4:9] <- perform_df[1:4, 2:7]
+# print confusion matrix
+icd_proc_endo_p2 <- df %>% 
+  group_by(ehr_case, chart_case) %>% 
+  summarise(Y = n(), .groups='drop') %>%
+  add_row(ehr_case = 'No Dx', chart_case = 'Prevalent', Y= 0) %>%
+  add_row(ehr_case = 'No Dx', chart_case = 'Incident', Y= 0) %>%
+  ggplot(data=., aes(x = ehr_case, y = chart_case)) +
+  geom_tile(aes(fill = Y), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Y)), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "#009299") +
+  xlab('Predicted class') + ylab('True class') + 
+  theme_bw() + theme(legend.position = "none") +
+  scale_y_discrete(limits = c("No Dx", "Prevalent", "Incident")) +
+  scale_x_discrete(limits = c("Incident", "Prevalent", "No Dx"))
+```
+
+```{r multi_icd_diag}
+# Uterine fibroids
+
+# select variables
+df <- validate_cases(uf_ids, 'uf_gold_dx', 'uf_algorithm')
+df$chart_case <- factor(df$chart_case, levels=c('Incident', 'Prevalent', 'No Dx'))
+df$ehr_case <- factor(df$ehr_case, levels=c('Incident', 'Prevalent', 'No Dx'))
+perform_df <- performance_stats(df, type='multi', approach='uf_icd_diag')
+# add to multi_table
+multi_table[9:12, 4:9] <- perform_df[1:4, 2:7]
+# print confusion matrix
+icd_diag_uf_p2 <- df %>% 
+  group_by(ehr_case, chart_case) %>% 
+  summarise(Y = n(), .groups='drop') %>%
+  ggplot(data=., aes(x = ehr_case, y = chart_case)) +
+  geom_tile(aes(fill = Y), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Y)), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "#009299") +
+  xlab('Predicted class') + ylab('True class') + 
+  theme_bw() + theme(legend.position = "none") +
+  scale_y_discrete(limits = c("No Dx", "Prevalent", "Incident")) +
+  scale_x_discrete(limits = c("Incident", "Prevalent", "No Dx"))
+
+# Endometriosis
+
+# select variables
+df <- validate_cases(endo_ids, 'endo_gold_dx', 'endo_algorithm')
+df$chart_case <- factor(df$chart_case, levels=c('Incident', 'Prevalent', 'No Dx'))
+df$ehr_case <- factor(df$ehr_case, levels=c('Incident', 'Prevalent', 'No Dx'))
+perform_df <- performance_stats(df, type='multi', approach='endo_icd_diag')
+# add to multi_table
+multi_table[21:24, 4:9] <- perform_df[1:4, 2:7]
+# print confusion matrix
+icd_diag_endo_p2 <- df %>% 
+  group_by(ehr_case, chart_case) %>% 
+  summarise(Y = n(), .groups='drop') %>%
+  add_row(ehr_case = 'No Dx', chart_case = 'Prevalent', Y= 0) %>%
+  ggplot(data=., aes(x = ehr_case, y = chart_case)) +
+  geom_tile(aes(fill = Y), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Y)), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "#009299") +
+  xlab('Predicted class') + ylab('True class') + 
+  theme_bw() + theme(legend.position = "none") +
+  scale_y_discrete(limits = c("No Dx", "Prevalent", "Incident")) +
+  scale_x_discrete(limits = c("Incident", "Prevalent", "No Dx"))
+```
+
+```{r, out.width='100%'}
+fig2 <- ggarrange(icd_uf_p2 + rremove("xlab"), icd_proc_uf_p2 + rremove("ylab") + rremove("xlab"), 
+          icd_diag_uf_p2 + rremove("ylab") + rremove("xlab"), icd_endo_p2, 
+          icd_proc_endo_p2 + rremove("ylab"), icd_diag_endo_p2 + rremove("ylab"),
+          nrow=2, ncol=3, labels=c('1a', '2a', '3a', '1b', '2b', '3b'))
+
+pdf("Data/Derived/Chart Review/Figure2_multi_confMat.pdf", width = 11.5, height=7)
+fig2
+dev.off()
+
+fig2
+```
+
+
+```{r}
+kable(multi_table %>% select(-Outcome), digits=2) %>%
+  kable_styling() %>%
+  group_rows(1,12, group_label = 'Uterine fibroids') %>%
+  group_rows(13,24, group_label = 'Endometriosis')
+```
+
+### {.unnumbered}
+
+## Investigate incident vs prevalent cases from above to tweak algorithm
+
+```{r, eval=FALSE}
+hint_list <- c('imaging_confirmed', 'surgery_confirmed', 'ever_confirmed_6months', 'any_location',
+                      #'prevalent_dx_after_proc','ever_pregnancy_related', 'multiple_referral',
+                      'dx_after_partial_LTFU')
+
+no_match <- true_df_clean %>%
+  filter(mrn %in% uf_ids) %>%
+  left_join(pred_df, by='mrn') %>%
+  mutate(match = case_when(uf_gold_dx == uf_algorithm~TRUE,
+                        uf_gold_dx == "No Dx" & uf_algorithm == 'Incident'~FALSE)) %>%
+  select(mrn, match) 
+
+uf_matches <- uf_cohort %>% 
+  left_join(pat_cohort %>% select(pat_id, pat_mrn_id),  by='pat_id') %>%
+  rename(mrn = pat_mrn_id) %>%
+  inner_join(no_match, by='mrn')
+
+uf_matches %>%
+  mutate(number_pos_hints = rowSums(.[hint_list], na.rm=TRUE)) %>%
+  filter(number_pos_hints < 2) %>%
+  CreateTableOne(data=., includeNA=TRUE, strata='match', vars=hint_list)
+
+## NEED TO KNOW WHICH CASES ARE ONLY ONE OF EACH
+corrplot.mixed(cor(uf_matches[,c(hint_list, "match")], 
+                   use='pairwise.complete.obs'),  # Correlation matrix
+               lower = "number", 
+               upper = "ellipse",
+               tl.cex=0.5,
+               number.cex=0.5,
+               tl.pos = "lt",
+               tl.col = "black") 
+
+# let's try to redefine confident incident without prevalent after dx and multiple referral
+```
+From this, I determined that the `multiple_referral` and the `prevalent_after_dx_proc` were the two problematic confirmation types. Therefore, these cases became prevalent cases.s
+
+```{r, eval=FALSE}
+hint_list <- c('imaging_confirmed', 'surgery_confirmed', 'ever_confirmed_6months', 'any_location',
+                      'dx_after_partial_LTFU', 'dx_via_laparoscopy')
+
+no_match <- true_df_clean %>%
+  filter(mrn %in% endo_ids) %>%
+  left_join(pred_df, by='mrn') %>%
+  mutate(match = case_when(endo_gold_dx == "No Dx" & endo_algorithm == 'Incident'~FALSE,
+                           endo_gold_dx == endo_algorithm~TRUE,
+                           TRUE~NA)) %>%
+  select(mrn, match) 
+
+endo_matches <- endo_cohort %>% 
+  left_join(pat_cohort %>% select(pat_id, pat_mrn_id),  by='pat_id') %>%
+  rename(mrn = pat_mrn_id) %>%
+  inner_join(no_match, by='mrn') %>%
+  left_join(adeno, by='pat_id')
+
+# how many endo patients have only billing Endo codes & adenomyosis
+endo_cohort %>% 
+  left_join(adeno, by='pat_id') %>%
+  filter(first_dx_type == 'Hospital Account Diagnosis' & dx_count < 2 & adeno_final=='Yes') %>%
+  View()
+
+# look at cases who are No Dx but incident Endo in EHR
+true_df_clean %>% 
+  filter(mrn %in% no_match$mrn[which(!no_match$match)]) %>% 
+  select(mrn, contains('endo')) %>%
+  left_join(adeno %>% left_join(pat_cohort %>% select(pat_id, pat_mrn_id), by='pat_id'), 
+            by=c('mrn'='pat_mrn_id')) %>%
+  View()
+
+endo_matches %>%
+  mutate(number_pos_hints = rowSums(.[hint_list], na.rm=TRUE)) %>%
+  filter(number_pos_hints < 2) %>%
+  CreateTableOne(data=., includeNA=TRUE, strata='match', vars=hint_list)
+
+## NEED TO KNOW WHICH CASES ARE ONLY ONE OF EACH
+corrplot.mixed(cor(endo_matches[,c(hint_list, "match")], 
+                   use='pairwise.complete.obs'),  # Correlation matrix
+               lower = "number", 
+               upper = "ellipse",
+               tl.cex=0.5,
+               number.cex=0.5,
+               tl.pos = "lt",
+               tl.col = "black") 
+
+# let's try to redefine confident incident without prevalent after dx and multiple referral
+```
+From this, I determined that those with only one Endo billing code but and Adeno diagnosis are more likely to be mistakenly categorized as Endo and therefore, made those false positive Endo cases in the algorithm and set them to 'No Dx'. 
+
+## Ability to determine first date of diagnosis {.tabset}
+
+Among true cases, how well does the first ICD-10 code in the EHR correspond to the earliest diagnosis date in the EHR based on chart review?
+
+### Uterine fibroids
+
+```{r uf_dx_date_accuracy}
+uf_dates_comp <- true_df_clean %>%
+  filter(mrn %in% uf_ids) %>%
+  left_join(pred_df, by='mrn') %>%
+  filter(uf_gold_dx == 'Incident' & uf_algorithm == 'Incident') %>%
+  mutate(true_v_pred_date_gap = uf_earliest_dx_date-uf_first_dx_date,
+         date_group = case_when(true_v_pred_date_gap < -60 ~'More than 60 days before',
+                                true_v_pred_date_gap >= -60  & true_v_pred_date_gap <= 60 ~'Within 60 days',
+                                true_v_pred_date_gap > 60 ~'More than 60 after'),
+         gold_person_time = as.numeric((uf_earliest_dx_date-as.Date(index_enc_date))/30),
+         pred_person_time = as.numeric((uf_first_dx_date-as.Date(index_enc_date))/30))
+         
+
+#summarize frequencies of date group in table
+my_table <- as.data.frame(table(uf_dates_comp$date_group))
+my_table$Freq <- paste(my_table$Freq, '(',round(my_table$Freq/sum(my_table$Freq)*100, 1),'%)')
+names(my_table) <- c('Type', 'Count (%)')
+
+ggplot(aes(x=as.numeric(true_v_pred_date_gap)), data=uf_dates_comp) +
+  geom_histogram(bins = 100, color='white') +
+  geom_vline(xintercept = 60, color='red') +
+  geom_vline(xintercept = -60, color='red') +
+  xlab('Time from earliest Dx date & first ICD-code (days)') +
+  annotation_custom(tableGrob(my_table, rows=NULL), xmin=-1000, xmax=-500, ymin=20, ymax=20)
+```
+
+```{r}
+summary(as.integer(uf_dates_comp$true_v_pred_date_gap[which(uf_dates_comp$true_v_pred_date_gap != 0)]/30))
+```
+
+```{r}
+x <- sum(as.integer(uf_dates_comp$pred_person_time))-sum(as.integer(uf_dates_comp$gold_person_time), na.rm=TRUE)
+
+y <- x/sum(as.integer(uf_dates_comp$gold_person_time), na.rm=TRUE)
+
+print(paste('The total misattributed person-time due to incorrect earliest UF dx date from ICD-10 in validation study is', round(x,2), 'person-months. This amounts to a', round(y*100, 2), '% difference in total person time for incident cases.'))
+```
+
+
+### Endometriosis
+
+```{r endo_dx_date_accuracy}
+endo_dates_comp <- true_df_clean %>%
+  filter(mrn %in% endo_ids) %>%
+  left_join(pred_df, by='mrn') %>%
+  filter(endo_gold_dx == 'Incident' & endo_algorithm == 'Incident') %>%
+  mutate(true_v_pred_date_gap = endo_earliest_dx_date-endo_first_dx_date,
+         date_group = case_when(true_v_pred_date_gap < -60 ~'More than 60 days before',
+                                true_v_pred_date_gap >= -60  & true_v_pred_date_gap <= 60 ~'Within 60 days',
+                                true_v_pred_date_gap > 60 ~'More than 60 after'),
+         gold_person_time = as.numeric((endo_earliest_dx_date-as.Date(index_enc_date))/30),
+         pred_person_time = as.numeric((endo_first_dx_date-as.Date(index_enc_date))/30))
+
+#summarize frequencies of date group in table
+my_table <- as.data.frame(table(endo_dates_comp$date_group))
+my_table$Freq <- paste(my_table$Freq, '(',round(my_table$Freq/sum(my_table$Freq)*100, 1),'%)')
+names(my_table) <- c('Type', 'Count (%)')
+
+ggplot(aes(x=as.numeric(true_v_pred_date_gap)), data=endo_dates_comp) +
+  geom_histogram(bins = 100, color='white') +
+  geom_vline(xintercept = 60, color='red') +
+  geom_vline(xintercept = -60, color='red') +
+  xlab('Time from earliest Dx date & first ICD-code (days)') +
+  annotation_custom(tableGrob(my_table, rows=NULL), xmin=1500, xmax=2000, ymin=20, ymax=20)
+```
+
+```{r}
+summary(as.integer(endo_dates_comp$true_v_pred_date_gap/30))
+```
+
+```{r}
+x <- sum(as.integer(endo_dates_comp$pred_person_time))-sum(as.integer(endo_dates_comp$gold_person_time), na.rm=TRUE)
+
+y <- x/sum(as.integer(endo_dates_comp$gold_person_time), na.rm=TRUE)
+
+print(paste('The total misattributed person-time due to incorrect earliest Endo dx date from ICD-10 in validation study is', round(x,2), 'person-months. This amounts to a', round(y*100, 2), '% difference in total person time for incident cases.'))
+```
+
+### {.unnumbered}
+
+## Sensitivity validations {.tabset}
+
+### Both cases
+
+What percent are truly both? What percent are one but not the other? What percent are neither?
+
+```{r subset_both}
+both_df <- true_df_clean %>% 
+  filter(mrn %in% chart_info$mrn[which(chart_info$condition == 'Both')])
+```
+
+```{r clean_both}
+both_df_clean <- both_df %>%
+  mutate(both_gold_dx = case_when(uf_gold_dx == 'Incident' & endo_gold_dx == 'Incident'~'Both Incident',
+                                  uf_gold_dx == 'No Dx' & endo_gold_dx == 'Incident'~'Endo only',
+                                  uf_gold_dx == 'Incident' & endo_gold_dx == 'No Dx'~'UF only',
+                                  uf_gold_dx == 'No Dx' & endo_gold_dx == 'No Dx'~'Neither',
+                                  TRUE~'Other')) %>%
+  left_join(pred_df %>% select(mrn, index_enc_date, final_outcome_status), by='mrn') %>%
+  filter(final_outcome_status == 'Both Incident') %>%
+  rename(both_pred_dx = final_outcome_status) %>%
+  mutate(both_gold_dx = as.factor(both_gold_dx), 
+         both_pred_dx = as.factor(both_pred_dx)) 
+```
+
+```{r}
+CreateTableOne(data=both_df_clean, var='endo_gold_dx', strata='uf_gold_dx')
+```
+
+
+```{r}
+both_df_clean %>% 
+  group_by(uf_gold_dx, endo_gold_dx) %>% 
+  summarise(Y = n(), .groups='drop') %>%
+  add_row(uf_gold_dx = 'No Dx', endo_gold_dx = 'Incident', Y = 0) %>%
+  add_row(uf_gold_dx = 'No Dx', endo_gold_dx = 'Prevalent', Y = 0) %>%
+  add_row(uf_gold_dx = 'No Dx', endo_gold_dx = 'No Dx', Y = 0) %>%
+  ggplot(data=., aes(x = uf_gold_dx, y = endo_gold_dx)) +
+  geom_tile(aes(fill = Y), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Y)), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "#009299") +
+  xlab('UF True class') + ylab('Endo True class') + 
+  theme_bw() + theme(legend.position = "none") +
+  scale_y_discrete(limits = c("No Dx", "Prevalent", "Incident")) +
+  scale_x_discrete(limits = c("Incident", "Prevalent", "No Dx"))
+```
+
+### False negatives
+
+What percent are controls? What percent are prevalent cases? What percent are true cases?
+```{r subset_false_neg}
+false_negative_df <- true_df_clean %>% 
+  left_join(chart_info, by='mrn') %>%
+  filter(type == 'putative false positive')
+
+CreateTableOne(vars=c('uf_gold_dx', 'endo_gold_dx'), data=false_negative_df)
+```
+
+Where were those who were diagnosed actually diagnosed and how was it incdicated in EHR?
+```{r false_neg_char}
+false_negative_df %>%
+  filter(uf_gold_dx != 'No Dx') %>%
+  left_join(redcap_df %>% select(mrn, imaging_site_uf, surgery_site_uf), by='mrn') %>%
+  select(uf_clinical_chart, uf_imaging_chart, uf_surgery_chart, imaging_site_uf, surgery_site_uf, notes_final) %>%
+  summary()
+```
+### {.unnumbered}

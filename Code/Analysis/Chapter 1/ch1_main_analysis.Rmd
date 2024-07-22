@@ -1,0 +1,371 @@
+---
+title: "Chapter 1 Main Analysis"
+author: "Mia Charifson"
+date: "2024-07-08"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+knitr::opts_knit$set(root.dir = '/Users/miacharifson/Library/CloudStorage/OneDrive-NYULangoneHealth/Charifson Dissertation/')
+
+library(mice)
+library(tidyverse)
+library(tidyr)
+library(ggplot2)
+library(survival)
+library(survminer)
+library(coxme)
+library(finalfit)
+library(knitr)
+library(kableExtra)
+library(gtsummary)
+library(mitools)
+library(gt)
+```
+
+## Chapter One Main Analysis
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r load}
+load('Data/Derived/all_data_imputed_20240718.Rdata')
+ch1_samples <- read.csv('Data/Derived/Chapter 1/sample_flags_20240626.csv')
+ch1_noImp <- read_csv("Data/Derived/Chapter 1/final_dataset_20240626.csv", show_col_types = FALSE)
+```
+
+## Subset to main analysis cohort
+
+```{r}
+length(which(ch1_samples$ch1_main))
+
+ch1_main <- complete(imp_df2, action='long', include = TRUE) %>% 
+  filter(pat_id %in% ch1_samples$pat_id[which(ch1_samples$ch1_main)]) %>%
+  left_join(ch1_noImp %>% select(pat_id, GEOID, ICE_quartile, gent_index,
+                                 final_censor_date, index_enc_date, last_enc_date), by='pat_id') %>%
+  mutate(uf_person_time = case_when(is.na(final_censor_date)~
+                                    difftime(last_enc_date, as.Date(index_enc_date),units='days'),
+                                  TRUE~difftime(as.Date(final_censor_date),as.Date(index_enc_date),units='days')),
+         uf_person_time = as.numeric(uf_person_time)/30) %>%
+  mutate(endo_person_time = case_when(is.na(final_censor_date)~
+                                    difftime(last_enc_date, as.Date(index_enc_date),units='days'),
+                                  TRUE~difftime(as.Date(final_censor_date),as.Date(index_enc_date),units='days')),
+         endo_person_time = as.numeric(endo_person_time)/30) %>%
+  mutate(gent_quartile = factor(ntile(gent_index, 4), labels = c('Q1', 'Q2', 'Q3', 'Q4'))) %>%
+  select(-contains('CT'))
+
+# length(unique(ch1_main$pat_id)) ## Matches!
+
+ch1_main <- as.mids(ch1_main)
+
+save(ch1_main, file='Data/Derived/Chapter 1/ch1_main_imputed_20240718.Rdata')
+```
+
+https://www.r-bloggers.com/2019/09/survival-analysis-with-strata-clusters-frailties-and-competing-risks-in-in-finalfit/
+https://cran.r-project.org/web/views/Survival.html
+https://stackoverflow.com/questions/49201232/how-to-fit-frailty-survival-models-in-r
+
+```{r}
+ch1_noImp <- ch1_noImp %>% filter(pat_id %in% ch1_main$data$pat_id)
+
+#ch1_main$imp$ICE_RI
+#summary(ch1_noImp$GEOID)
+#summary(ch1_noImp$ICE_RI)
+#summary(factor(ch1_noImp$ICE_quartile))
+
+# because I already subset to those with GEOID in ch1_samples, no ICE_RI or ICE_quartile values are imputed
+```
+
+
+# Analyses {.tabset}
+
+### Survival Plots
+
+```{r}
+surv_uf <- survfit(Surv(uf_person_years*12, uf_binary) ~ ICE_quartile, 
+                   data = ch1_noImp %>% filter(pat_id %in% ch1_main$data$pat_id))
+ggsurvplot(surv_uf, data=ch1_noImp,
+           conf.int = TRUE,
+           pval = TRUE,
+           fun = "event",
+           risk.table = FALSE,
+           size = 1,
+           linetype = "strata",
+           #palette = c("#E7B800","#2E9FDF"),
+           legend = "bottom",
+           legend.title = "ICE race+income Quartile",
+           legend.labs = c("Q1", "Q2", "Q3", "Q4"))
+```
+```{r}
+surv_uf <- survfit(Surv(endo_person_years*12, endo_binary) ~ ICE_quartile, 
+                   data = ch1_noImp %>% filter(pat_id %in% ch1_main$data$pat_id))
+ggsurvplot(surv_uf, data=ch1_noImp,
+           conf.int = TRUE,
+           pval = TRUE,
+           fun = "event",
+           risk.table = FALSE,
+           size = 1,
+           linetype = "strata",
+           #palette = c("#E7B800","#2E9FDF"),
+           legend = "bottom",
+           legend.title = "ICE race+income Quartile",
+           legend.labs = c("Q1", "Q2", "Q3", "Q4"))
+```
+
+### Model 1: Cox PH model with random effect for CT
+
+### Diagnostics for raw model
+
+```{r, warning=FALSE}
+# making the model
+myfit <- coxph(Surv(uf_person_years*12, uf_binary) ~ ICE_quartile + frailty(GEOID), data = ch1_noImp)
+
+# assessing the proportionality of hazards
+ftest <- cox.zph(myfit)
+ggcoxzph(ftest)
+```
+
+Appears to pass the PH assumption when using frailty model (slightly different estimates than `coxme`).
+
+```{r, warning=FALSE}
+# making the model
+myfit <- coxph(Surv(endo_person_years*12, endo_binary) ~ ICE_quartile + frailty(GEOID), data = ch1_noImp)
+
+# assessing the proportionality of hazards
+ftest <- cox.zph(myfit)
+ggcoxzph(ftest)
+```
+
+#### Unadjusted
+
+```{r}
+uf_m1_unadj_cont <- coxme(Surv(uf_person_years*12, uf_binary) ~ ICE_RI + (1|GEOID), data=ch1_noImp)
+uf_m1_unadj_quartile <- coxme(Surv(uf_person_years*12, uf_binary) ~ ICE_quartile + (1|GEOID), data=ch1_noImp)
+endo_m1_unadj_cont <- coxme(Surv(endo_person_years*12, endo_binary) ~ ICE_RI + (1|GEOID), data=ch1_noImp)
+endo_m1_unadj_quartile <- coxme(Surv(endo_person_years*12, endo_binary) ~ ICE_quartile + (1|GEOID), data=ch1_noImp)
+```
+
+```{r}
+# Uterine fibroid results
+tbl1 <- uf_m1_unadj_cont %>% tbl_regression(exponentiate=TRUE)
+tbl2 <- uf_m1_unadj_quartile %>% tbl_regression(exponentiate=TRUE)
+uf_tbls <- tbl_stack(tbls=list(tbl1, tbl2))
+
+# Endometriosis results
+tbl3 <- endo_m1_unadj_cont %>% tbl_regression(exponentiate=TRUE)
+tbl4 <- endo_m1_unadj_quartile %>% tbl_regression(exponentiate=TRUE)
+endo_tbls <- tbl_stack(tbls=list(tbl3, tbl4))
+
+tbl_merge(list(uf_tbls, endo_tbls), tab_spanner = c("**Uterine Fibroids**", "**Endometriosis**"))
+```
+
+#### Adjusted
+
+```{r, results='hide'}
+uf_m1_adj <- with(data=ch1_main, exp=coxme(Surv(uf_person_time, uf_binary) ~ ICE_quartile + age_20160801 + hcu_baseline + insur_status_filled + (1|GEOID)))
+
+betas<-MIextract(uf_m1_adj$analyses,fun=coefficients)
+vars<-MIextract(uf_m1_adj$analyses, fun=vcov)
+
+pool.HR.uf <- MIcombine(lapply(betas, exp),vars) %>% summary() %>% select(results, `(lower`, `upper)`)
+
+colnames(pool.HR.uf) <- (c("HR", "95% LO", "95% UP"))
+```
+
+```{r}
+endo_m1_adj <- with(data=ch1_main, exp=coxme(Surv(endo_person_time, endo_binary) ~ ICE_quartile + age_20160801 + hcu_baseline + insur_status_filled + (1|GEOID)))
+
+betas<-MIextract(endo_m1_adj$analyses,fun=coefficients)
+vars<-MIextract(endo_m1_adj$analyses, fun=vcov)
+
+pool.HR.endo <- MIcombine(lapply(betas, exp),vars) %>% summary() %>% select(results, `(lower`, `upper)`)
+
+colnames(pool.HR.endo) <- (c("HR", "95% LO", "95% UP"))
+```
+
+```{r}
+gtTable = gt(pool.HR.uf)
+table1 = gtTable$`_data`
+gtTable = gt(pool.HR.endo)
+table2 = gtTable$`_data`
+
+
+Characteristic = c('Q2', 'Q3', 'Q4', 'Age (years)', 'HCU', 'Insurance-public')
+fullTable = cbind(Characteristic, table1, table2)
+fullTable = rbind(c("Q1", 1, 0, 0, 1, 0, 0), fullTable)
+fullTable[,2:7] <- lapply(fullTable[,2:7], as.numeric)
+kable(fullTable, format='html', digits=3) %>%
+  kable_styling() %>%
+  pack_rows('ICE Quartile', 1, 3) %>%
+  add_header_above(header = c("", "Uterine Fibroids" = 3, "Endometriosis" = 3))
+```
+
+### Model 2.1: Model 1 with interaction with race/ethnicity
+
+#### Compare model fit with and without interaction term
+
+```{r}
+uf_m2_unadj_int <- with(data=ch1_main, exp=coxme(Surv(uf_person_time, uf_binary) ~ ICE_quartile*race_ethnic_final +
+                                                   (1|GEOID)))
+betas<-MIextract(uf_m2_unadj_int$analyses,fun=coefficients)
+vars<-MIextract(uf_m2_unadj_int$analyses, fun=vcov)
+Cox.pool <- summary(MIcombine(lapply(betas, exp),vars))
+pool.HR <- Cox.pool %>% dplyr::select(results, `(lower`, `upper)`)
+
+colnames(pool.HR) <- (c("HR", "95% LO", "95% UP"))
+kable(pool.HR, digits=2) %>%
+  kable_styling()
+```
+
+#### Adjusted
+
+```{r}
+uf_m2_adj_int <- with(data=ch1_main, exp=coxme(Surv(uf_person_time, uf_binary) ~ ICE_quartile*race_ethnic_final +
+                                                   age_20160801 + hcu_baseline + insur_status_filled + (1|GEOID)))
+betas<-MIextract(uf_m2_adj_int$analyses,fun=coefficients)
+vars<-MIextract(uf_m2_adj_int$analyses, fun=vcov)
+Cox.pool <- summary(MIcombine(lapply(betas, exp),vars))
+pool.HR <- Cox.pool %>% dplyr::select(results, `(lower`, `upper)`)
+
+colnames(pool.HR) <- (c("HR", "95% LO", "95% UP"))
+kable(pool.HR, digits=2) %>%
+  kable_styling()
+```
+
+### Model 2.2: Model 1 stratified by race/ethnicity
+
+#### Unadjusted
+
+```{r}
+race_ethnic_groups <- unique(ch1_noImp$race_ethnic_final[which(!is.na(ch1_noImp$race_ethnic_final))])
+pool.HR <- data.frame(category = character(), results = numeric(), `(lower` = numeric(), `upper)` = numeric())
+
+for(i in 1:length(race_ethnic_groups)) {
+  group <- race_ethnic_groups[i]
+  uf_m2_unadj_strat <- with(data=ch1_main %>% filter(race_ethnic_final ==  group), 
+                      exp=coxme(Surv(uf_person_time, uf_binary) ~ ICE_quartile + (1|GEOID)))
+  betas<-MIextract(uf_m2_unadj_strat$analyses,fun=coefficients)
+  vars<-MIextract(uf_m2_unadj_strat$analyses, fun=vcov)
+  Cox.pool <- summary(MIcombine(lapply(betas, exp),vars))
+  pool.HR <- rbind(pool.HR, Cox.pool %>% dplyr::mutate(category = group) %>% dplyr::select(category, results, `(lower`, `upper)`))
+  print(paste(group, ' done.'))
+}
+
+colnames(pool.HR) <- (c("Racial/ethnic group", "HR", "95% LO", "95% UP"))
+kable(pool.HR, digits=3)
+```
+
+#### Adjusted
+
+```{r}
+race_ethnic_groups <- unique(ch1_noImp$race_ethnic_final[which(!is.na(ch1_noImp$race_ethnic_final))])
+pool.HR <- data.frame(category = character(), results = numeric(), `(lower` = numeric(), `upper)` = numeric())
+
+for(i in 1:length(race_ethnic_groups)) {
+  group <- race_ethnic_groups[i]
+  uf_m2_adj_strat <- with(data=ch1_main %>% filter(race_ethnic_final ==  group), 
+                      exp=coxme(Surv(uf_person_time, uf_binary) ~ ICE_quartile + age_20160801 + hcu_baseline +
+                                  insur_status_filled + (1|GEOID)))
+  betas<-MIextract(uf_m2_adj_strat$analyses,fun=coefficients)
+  vars<-MIextract(uf_m2_adj_strat$analyses, fun=vcov)
+  Cox.pool <- summary(MIcombine(lapply(betas, exp),vars))
+  pool.HR <- rbind(pool.HR, Cox.pool %>% dplyr::mutate(category = group) %>% dplyr::select(category, results, `(lower`, `upper)`))
+  print(paste(group, ' done.'))
+}
+
+colnames(pool.HR) <- (c("Racial/ethnic group", "HR", "95% LO", "95% UP"))
+kable(pool.HR, digits=3)
+```
+
+### Model 3.1: Model 1 with interaction with gentrification index (subset to NYC boroughs)
+
+```{r}
+ch1_noImp <- ch1_noImp %>%
+  mutate(gent_quartile = factor(ntile(gent_index, 4), labels = c('Q1', 'Q2', 'Q3', 'Q4')))
+
+CreateTableOne(data=ch1_noImp, var='gent_quartile', strata='ICE_quartile')
+```
+
+#### Unadjusted
+
+```{r}
+uf_m3_unadj_int <- with(data=ch1_main, exp=coxme(Surv(uf_person_time, uf_binary) ~ ICE_quartile*gent_quartile +(1|GEOID)))
+betas<-MIextract(uf_m3_unadj_int$analyses,fun=coefficients)
+vars<-MIextract(uf_m3_unadj_int$analyses, fun=vcov)
+Cox.pool <- summary(MIcombine(lapply(betas, exp),vars))
+pool.HR <- Cox.pool %>% dplyr::select(results, `(lower`, `upper)`)
+
+colnames(pool.HR) <- (c("HR", "95% LO", "95% UP"))
+kable(pool.HR, digits=2) %>%
+  kable_styling()
+```
+
+#### Adjusted
+
+```{r}
+uf_m3_adj_int <- with(data=ch1_main, exp=coxme(Surv(uf_person_time, uf_binary) ~ ICE_quartile*gent_quartile +
+                                                   age_20160801 + hcu_baseline + insur_status_filled + (1|GEOID)))
+betas<-MIextract(uf_m3_adj_int$analyses,fun=coefficients)
+vars<-MIextract(uf_m3_adj_int$analyses, fun=vcov)
+Cox.pool <- summary(MIcombine(lapply(betas, exp),vars))
+pool.HR <- Cox.pool %>% dplyr::select(results, `(lower`, `upper)`)
+
+colnames(pool.HR) <- (c("HR", "95% LO", "95% UP"))
+kable(pool.HR, digits=2) %>%
+  kable_styling()
+```
+
+### Model 3.2: Model 1 stratified by  gentrification index (subset to NYC boroughs)
+
+SUBSET TO THOSE IN NYC BOROUGHS
+
+#### Unadjusted
+
+```{r}
+gent_groups <- unique(ch1_noImp$gent_quartile[which(!is.na(ch1_noImp$gent_quartile))])
+pool.HR <- data.frame(category = character(), results = numeric(), `(lower` = numeric(), `upper)` = numeric())
+
+for(i in 1:length(gent_groups)) {
+  group <- gent_groups[i]
+  uf_m3_unadj_strat <- with(data=ch1_main %>% filter(gent_quartile ==  group), 
+                      exp=coxme(Surv(uf_person_time, uf_binary) ~ ICE_quartile + (1|GEOID)))
+  betas<-MIextract(uf_m3_unadj_strat$analyses,fun=coefficients)
+  vars<-MIextract(uf_m3_unadj_strat$analyses, fun=vcov)
+  Cox.pool <- summary(MIcombine(lapply(betas, exp),vars))
+  pool.HR <- rbind(pool.HR, Cox.pool %>% dplyr::mutate(category = group) %>% dplyr::select(category, results, `(lower`, `upper)`))
+  print(paste(group, ' done.'))
+}
+
+colnames(pool.HR) <- (c("Gentrification Index Quartile", "HR", "95% LO", "95% UP"))
+kable(pool.HR, digits=3) %>% kable_styling()
+```
+
+#### Adjusted
+
+```{r}
+pool.HR <- data.frame(category = character(), results = numeric(), `(lower` = numeric(), `upper)` = numeric())
+
+for(i in 1:length(gent_groups)) {
+  group <- gent_groups[i]
+  uf_m3_adj_strat <- with(data=ch1_main %>% filter(gent_quartile ==  group), 
+                      exp=coxme(Surv(uf_person_time, uf_binary) ~ ICE_quartile + age_20160801 + hcu_baseline +
+                                  insur_status_filled + (1|GEOID)))
+  betas<-MIextract(uf_m3_adj_strat$analyses,fun=coefficients)
+  vars<-MIextract(uf_m3_adj_strat$analyses, fun=vcov)
+  Cox.pool <- summary(MIcombine(lapply(betas, exp),vars))
+  pool.HR <- rbind(pool.HR, Cox.pool %>% dplyr::mutate(category = group) %>% dplyr::select(category, results, `(lower`, `upper)`))
+  print(paste(group, ' done.'))
+}
+
+colnames(pool.HR) <- (c("Gentrification Index Quartile", "HR", "95% LO", "95% UP"))
+kable(pool.HR, digits=3)
+```
+
+
+
