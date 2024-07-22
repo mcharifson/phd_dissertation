@@ -11,8 +11,10 @@ where (procedure_code in ('1962', '38589', '58150', '58180', '58210', '58260','5
     -- imaging procedures
     regexp_like(lower(procedure_name), 'hysteroscopy|hysterosalpingography|sonohysterography') or
     -- fibroid ablation
-    regexp_like(lower(procedure_name), 'fibroid|leiomyoma') or
+    regexp_like(lower(procedure_name), 'fibroid|leiomyoma') or 
     -- endometrial biopsy
     (regexp_like(lower(procedure_name), 'endometri') and regexp_like(lower(procedure_name), 'bx|biopsy')))
+    
+    
     
 

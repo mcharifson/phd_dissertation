@@ -9,7 +9,7 @@ where dx_date < '2017-12-31' and
 ),
 surgery_codes as (
 select pat_id
-from sr3452058_table3_diagnosis
+from sr3452058_table4_surgical_procedure
 where surgery_date < '2017-12-31' and regexp_like(lower(procedure_name), 'cesarean')
 ),
 all_ids as (
