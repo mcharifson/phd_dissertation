@@ -1,5 +1,5 @@
 ---
-title: "Step 2.03: Symptom Outcome Exploration"
+title: "Step 5.01: Symptom Outcome Exploration"
 author: "Mia Charifson"
 date: "2024-02-12"
 output: 
@@ -39,47 +39,35 @@ symptoms2 <- read.csv('Data/Epic/table3_dx_symptoms2.csv')
 uf_hints <- read.csv('Data/Derived/uf_all_hints.csv')
 endo_hints <- read.csv('Data/Derived/endo_all_hints.csv')
 address <- read.csv('Data/Derived/Chapter 1/pat_cohort_w_address.csv')
+pat_cohort_new <- read.csv('Data/Derived/final_cohort_w_outcome.csv')
 ```
 
 ```{r join_outcomes}
-pat_cohort_new <- pat_cohort %>%
-  select(pat_id, index_enc_date) %>%
-  left_join(address %>% select(pat_id, censor_address_date, censor_address_type) %>%
-              rename(final_censor_date = censor_address_date,
-                     final_censor_type = censor_address_type), by='pat_id') %>%
-  left_join(uf_hints %>% select(pat_id, confident_incident, first_dx_date, first_confirm_date, 
-                                 first_confirm_type, first_confirm_name, first_location_date) %>%
-              rename_all(~paste0("uf_", .)), by=c('pat_id' = 'uf_pat_id')) %>%
-  left_join(endo_hints %>% select(pat_id, confident_incident, first_dx_date, first_confirm_date, 
-                     first_confirm_type, first_confirm_name, first_location_date) %>%
-              rename_all(~paste0("endo_", .)), by=c('pat_id' = 'endo_pat_id')) %>%
-  mutate(uf_dx = case_when(uf_confident_incident~TRUE, TRUE~FALSE),
-         endo_dx = case_when(endo_confident_incident~TRUE, TRUE~FALSE),
-         uf_first_dx_date = as.Date(uf_first_dx_date), endo_first_dx_date = as.Date(endo_first_dx_date), 
-         final_outcome_status = case_when((uf_dx & endo_dx) & 
+pat_cohort_all_cases <- pat_cohort_new %>%
+  mutate(final_outcome_status_all = case_when((uf_icd_confirmed & endo_icd_confirmed) & 
                                             uf_first_dx_date < endo_first_dx_date~'Both, UF first',
-                                          (uf_dx & endo_dx) & 
+                                          (uf_icd_confirmed & endo_icd_confirmed) & 
                                             uf_first_dx_date > endo_first_dx_date~'Both, Endo first',
-                                          (uf_dx & endo_dx) & 
+                                          (uf_icd_confirmed & endo_icd_confirmed) & 
                                             uf_first_dx_date == endo_first_dx_date~'Both, same day',
-                                          uf_dx & !endo_dx~'UF only',
-                                          !uf_dx & endo_dx~'Endo only',
-                                          !uf_dx & !endo_dx~'Control'),
-         first_outcome_dx_date = case_when(final_outcome_status %in% 
+                                          (uf_icd_confirmed & !endo_icd_confirmed)~'UF only',
+                                          (!uf_icd_confirmed & endo_icd_confirmed)~'Endo only',
+                                          (!uf_icd_confirmed & !endo_icd_confirmed)~'Control')) %>%
+  mutate(first_outcome_dx_date_all = case_when(final_outcome_status_all %in% 
                                              c('UF only', 'Both, UF first', 'Both, same day')~uf_first_dx_date,
-                                           final_outcome_status %in% 
+                                           final_outcome_status_all %in% 
                                              c('Endo only', 'Both, Endo first')~endo_first_dx_date),
-         outcome_before_censor = case_when(final_outcome_status == 'Control'~NA,
-                                           first_outcome_dx_date <= final_censor_date~TRUE,
+         outcome_before_censor = case_when(final_outcome_status_all == 'Control'~NA,
+                                           first_outcome_dx_date_all <= final_censor_date~TRUE,
                                            TRUE~FALSE),
-         final_censor_type_outcome = case_when(final_outcome_status != 'Control' & outcome_before_censor~'Case',
-                                               final_outcome_status %in% 
+         final_censor_type_all = case_when(final_outcome_status_all != 'Control' & outcome_before_censor~'Case',
+                                               final_outcome_status_all %in% 
                                                  c('UF only', 'Both, UF first', 'Both, same day') &
                                                  final_censor_type==uf_first_confirm_type~'Case',
-                                               final_outcome_status %in% c('Endo only', 'Both, Endo first') &
+                                               final_outcome_status_all %in% c('Endo only', 'Both, Endo first') &
                                                  final_censor_type==endo_first_confirm_type~'Case',
                                                TRUE~final_censor_type),
-         final_censor_date_outcome = case_when(final_censor_type_outcome=='Case'~first_outcome_dx_date,
+         final_censor_date_all = case_when(final_censor_type_all=='Case'~as.Date(first_outcome_dx_date_all),
                                                TRUE~as.Date(final_censor_date))) 
 ```
 
@@ -434,15 +422,29 @@ pat_cohort_symptoms <- pat_cohort_new %>%
               select(-index_enc_date, -n_specific_symptoms, -time_group, -flag),
             by='pat_id') %>%
   # make final censor date end of FU if NA
-  mutate(final_censor_date_outcome = case_when(is.na(final_censor_date_outcome)~as.Date('2023-08-01'),
-                                               TRUE~final_censor_date_outcome))
+  mutate(final_censor_date = case_when(is.na(final_censor_date)~as.Date('2023-08-01'),
+                                       TRUE~as.Date(final_censor_date)))
+
+pat_cohort_symptoms_all <- pat_cohort_all_cases %>%
+  inner_join(symptom_cohort %>%
+              rename(first_symptom_date = first_dx_date, 
+                     first_symptom_dx_name = first_dx_names, 
+                     first_symptom_icd10s = icd10s) %>%
+              select(-index_enc_date, -n_specific_symptoms, -time_group, -flag),
+            by='pat_id') %>%
+  # make final censor date end of FU if NA
+  mutate(final_censor_date_all = case_when(is.na(final_censor_date_all)~as.Date('2023-08-01'),
+                                       TRUE~as.Date(final_censor_date_all)))
 ```
 
-There are `r length(unique(pat_cohort_symptoms$pat_id))` patients with a first symptom during follow-up. However, further exclusions must be made if the first symptom is at or after censoring/after outcome diagnosis (n=`r length(which(pat_cohort_symptoms$first_symptom_date >= pat_cohort_symptoms$final_censor_date_outcome))`).
+There are `r length(unique(pat_cohort_symptoms$pat_id))` patients with a first symptom during follow-up. However, further exclusions must be made if the first symptom is at or after censoring/after outcome diagnosis (n=`r length(which(pat_cohort_symptoms$first_symptom_date >= pat_cohort_symptoms$final_censor_date))`).
 
 ```{r remove_after_dx_symptoms}
 pat_cohort_symptoms <- pat_cohort_symptoms %>%
-  filter(first_symptom_date < final_censor_date_outcome)
+  filter(first_symptom_date < final_censor_date)
+
+pat_cohort_symptoms_all <- pat_cohort_symptoms_all %>% 
+  filter(first_symptom_date < final_censor_date_all)
 ```
 
 The following descriptives are reported: 
@@ -484,15 +486,15 @@ symptom_cohort %>%
 ### 2
 
 ```{r calculate_ttd, results='asis'}
-pat_cohort_symptoms$ttd <- as.numeric(difftime(pat_cohort_symptoms$final_censor_date_outcome,
+pat_cohort_symptoms$ttd <- as.numeric(difftime(pat_cohort_symptoms$final_censor_date,
                                                pat_cohort_symptoms$first_symptom_date,
                                                unit='days'))/30
 
-pat_cohort_symptoms$ttd_2 <- as.numeric(difftime(pat_cohort_symptoms$final_censor_date_outcome,
+pat_cohort_symptoms$ttd_2 <- as.numeric(difftime(pat_cohort_symptoms$final_censor_date,
                                                  pat_cohort_symptoms$second_symptom_date,
                                                  unit='days'))/30
 
-pat_cohort_symptoms$ttd_2 <- ifelse(pat_cohort_symptoms$second_symptom_date >= pat_cohort_symptoms$final_censor_date_outcome,
+pat_cohort_symptoms$ttd_2 <- ifelse(pat_cohort_symptoms$second_symptom_date >= pat_cohort_symptoms$final_censor_date,
                                     NA, pat_cohort_symptoms$ttd_2)
 
 ttd_labs <- list('ttd'='Time from first symptom to diagnosis (months)',
@@ -501,6 +503,25 @@ ttd_labs <- list('ttd'='Time from first symptom to diagnosis (months)',
 ## show table for ttd by outcome status
 summary(tableby(final_outcome_status~ttd+ttd_2, data=pat_cohort_symptoms), labelTranslations= ttd_labs)
 ```
+
+Same descriptives but for all cases:
+```{r, results='asis'}
+# do the same for all cases
+pat_cohort_symptoms_all$ttd <- as.numeric(difftime(pat_cohort_symptoms_all$final_censor_date_all,
+                                               pat_cohort_symptoms_all$first_symptom_date,
+                                               unit='days'))/30
+
+pat_cohort_symptoms_all$ttd_2 <- as.numeric(difftime(pat_cohort_symptoms_all$final_censor_date_all,
+                                                 pat_cohort_symptoms_all$second_symptom_date,
+                                                 unit='days'))/30
+
+pat_cohort_symptoms_all$ttd_2 <- ifelse(pat_cohort_symptoms_all$second_symptom_date >= pat_cohort_symptoms_all$final_censor_date_all,
+                                    NA, pat_cohort_symptoms_all$ttd_2)
+
+## show table for ttd by outcome status
+summary(tableby(final_outcome_status_all~ttd+ttd_2, data=pat_cohort_symptoms_all), labelTranslations= ttd_labs)
+```
+
 
 ### 3
 
@@ -545,15 +566,15 @@ I leave off back pain and diarrhea off this as they are non-specific symptoms. I
 ```{r false_negatives}
 false_negatives <- symptoms %>%
   inner_join(pat_cohort_new %>% 
-               select(pat_id, final_censor_date_outcome), 
+               select(pat_id, final_censor_date), 
             by='pat_id') %>%
-  filter(dx_date <= final_censor_date_outcome) %>%
+  filter(dx_date <= final_censor_date) %>%
   group_by(pat_id) %>%
   summarise(n_specific_symptoms = sum(!grepl('M54.5|R19.7', icd10)),
             .groups='drop') %>%
   filter(n_specific_symptoms > 1) %>%
   left_join(ever_proc_info %>% select(pat_id, ever_imaging, ever_surgery), by='pat_id') %>%
-  filter(!pat_id %in% pat_cohort_new$pat_id[which(pat_cohort_new$final_censor_type_outcome == 'Case')])
+  filter(!pat_id %in% pat_cohort_new$pat_id[which(pat_cohort_new$final_censor_type == 'Case')])
 ```
 
 There are `r length(unique(false_negatives$pat_id))` patients who report at least two symptoms related to UF/Endo but never receive a UF or Endo diagnosis. Of these, 
@@ -593,6 +614,7 @@ pat_symptoms_all <- pat_cohort %>%
 # write out false negatives and chapter 2 cohort
 write.csv(pat_symptoms_all, 'Data/Derived/Chapter 2/pat_cohort_symptom_status.csv', row.names = FALSE)
 write.csv(pat_cohort_symptoms, 'Data/Derived/Chapter 2/pat_cohort_w_ttd.csv', row.names = FALSE)
+write.csv(pat_cohort_symptoms_all, 'Data/Derived/Chapter 2/pat_cohort_w_ttd_all_cases.csv', row.names = FALSE)
 write.csv(false_negatives, 'Data/Derived/putative_false_negatives.csv', row.names = FALSE)
 ```
 

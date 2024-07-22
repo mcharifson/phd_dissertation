@@ -39,6 +39,7 @@ hc_use_dx <- read.csv('Data/Epic/table3_dx_HCuse.csv')
 hc_use_social <- read.csv('Data/Epic/table6_social_HCuse.csv')
 prior_delivery_baseline <- read.csv('Data/Epic/table3_dx_prior_delivery.csv')
 race_ethnic_map <- read_excel('Data/External/race_ethnicity_mapping.xlsx', 1)
+dx_outcomes <- read.csv('Data/Epic/table3_dx_outcomes.csv')
 ```
 
 ```{r functions}
@@ -88,6 +89,7 @@ Additional covariates already derived but that need to be cleaned are:
 - Hormonal contraceptive use
 - Nativity/Immigration Status
 - BMI
+- Adenomyosis diagnosis
 
 (2) explore distributions of the covariates
 
@@ -315,7 +317,7 @@ employment_final %>%
 
 In 2017, the percent of US Americans on some kind of public health insurance was 34-37% (based on US Census data[https://www.census.gov/content/dam/Census/library/publications/2022/demo/p60-278.pdf]) This includes medicare, medicaid, VA, CHAMPVA plans and NYS specific plans (child & family health plus, managed care plans, essential plans).
 
-There are some index encounters with missing insurance information. They are predominantly from FHC encounters. It is unclear if this is because the patient had no insurnace or it was not entered for another reason. 
+There are some index encounters with missing insurance information. They are predominantly from FHC encounters. It is unclear if this is because the patient had no insurance or it was not entered for another reason. 
 
 ```{r clean_insur}
 insur_baseline_unique <- insur_baseline %>%
@@ -435,10 +437,14 @@ When cleaning the race and ethnicity data for missingness I use the following as
 - if someone reports more than one race, then they are labelled 'Multiple races'
 - if someone reports being Hispanic/Latino, then they are labelled 'Hispanic/Latino', therefore all race categories are labelled as non-Hispanic (NH)
 
-```{r clean_race_ethnic}
+```{r clean_race_ethnic, warning=FALSE}
 # recode the name information
 race_ethnic_map$name <- stringi::stri_encode(race_ethnic_map$name, to = 'ASCII')
 race_ethnic_map$name <- str_replace_all(race_ethnic_map$name , "\032", " ")
+race_ethnic_map$ethnicity_category <- stringi::stri_encode(race_ethnic_map$ethnicity_category, to = 'ASCII')
+race_ethnic_map$ethnicity_category <- str_replace_all(race_ethnic_map$ethnicity_category , "\032", " ")
+race_ethnic_map$race_category <- stringi::stri_encode(race_ethnic_map$race_category, to = 'ASCII')
+race_ethnic_map$race_category <- str_replace_all(race_ethnic_map$race_category , "\032", " ")
 
 # get distinct instances of race, ethnicity and number of times the patient indicated that identity
 race_new <- race %>%
@@ -453,111 +459,207 @@ ethnic_new <- ethnicity %>%
   rename(name = ethnicity) %>%
   left_join(race_ethnic_map, by='name') %>%
   mutate(across(where(is.character), ~na_if(., "NULL"))) %>%
-  left_join(ethnicity %>% distinct(pat_id, raw_ethnicity_group), by='pat_id')
+  left_join(ethnicity %>% distinct(pat_id, raw_ethnicity_group), by='pat_id') 
 
 # check if raw_ethnicity_group can fill in any gaps
 length(which(is.na(ethnic_new$ethnicity_category) & !is.na(ethnic_new$raw_ethnicity_group))) #1455
+
+# back fill with raw_ethnicity_group
+ethnic_new <- ethnic_new %>%
+  mutate(ethnicity_category = case_when(!is.na(ethnicity_category)~ethnicity_category,
+                                        raw_ethnicity_group == 'Not of Spanish/Hispanic Origin'~
+                                          raw_ethnicity_group,
+                                        raw_ethnicity_group %in% 
+                                          c('Spanish/Hispanic Origin', 'Other Hispanic, Latino/a, or Spanish Origin')~ 'Hispanic, Latino or Spanish Origin')) %>%
+  select(-raw_ethnicity_group)
 
 # join together
 race_ethnic <- rbind(race_new, ethnic_new)
 ```
 
+```{r race_ethnic_dummy}
+race_dum <- race_ethnic %>%
+  filter(pat_id %in% pat_cohort$pat_id) %>%
+  distinct(pat_id, race_category) %>%
+  filter(!is.na(race_category)) %>%
+  mutate(value = TRUE,
+         race_category = case_when(race_category == 'Middle Eastern or North African'~'MENA',
+                                   race_category=='Native American, First Peoples, or Alaskan Native'~
+                                     'native',
+                                   race_category == 'Native Hawaiian or Pacific Islander'~'NHPI',
+                                   TRUE~race_category)) %>%
+  pivot_wider(names_from = race_category, values_from = value, names_prefix = 'race_') %>%
+  mutate(across(race_White:race_MENA, ~replace_na(., FALSE))) 
 
-```{r clean_race_ethnic}
+ethnic_dum <- race_ethnic %>% 
+  distinct(pat_id, ethnicity_category) %>%
+  filter(!is.na(ethnicity_category)) %>%
+  group_by(pat_id) %>%
+  summarise(Hispanic = case_when(sum(ethnicity_category == 'Hispanic, Latino or Spanish Origin',
+                                  na.rm=TRUE)>=1~TRUE,
+                                 sum(!is.na(ethnicity_category))>=1~FALSE,
+                                 TRUE~NA), .groups='drop')
+```
 
-  
-ethnicity_strings <- c('Non-Hispanic/Latino', 'Hispanic/Latino')
-# create final version of race and ethnicity
-race_ethnic <- race_ethnic %>% group_by(pat_id) %>%
-  mutate(race_final = case_when(!is.na(fhc_race_group) & !fhc_race_group %in% ethnicity_strings~fhc_race_group, 
-                                !is.na(fhc_ethnicity) & !fhc_ethnicity %in% ethnicity_strings~fhc_ethnicity, 
-                                #is.na(fhc_race_group) & fhc_ethnicity!='Non-Hispanic/Latino'~fhc_ethnicity,
-                                TRUE~NA),
-         ethnicity_final = case_when(fhc_ethnicity %in% ethnicity_strings~fhc_ethnicity, 
-                                     fhc_race_group %in% ethnicity_strings~fhc_race_group,
-                                     !is.na(fhc_ethnicity) & !fhc_ethnicity %in% ethnicity_strings &
-                                       ethnicity_count > 1~'Non-Hispanic/Latino',
-                                     !is.na(fhc_race_group) & !fhc_race_group %in% ethnicity_strings &
-                                       race_count > 1~'Non-Hispanic/Latino',
-                                     TRUE~NA)) 
+```{r fhc_race_fill_in}
+# check if there are any that can be filled in the FHC data
+
+# FHC race values for ethnicity
+fhc_race1 <- race %>% 
+  left_join(race_dum, by='pat_id') %>%
+  filter(is.na(race_White) & !fhc_race_group %in% c('Unreported/Refused to Report Race',
+                                                    'Unmapped', 'Hispanic/Latino')) %>%
+  mutate(fhc_race_group = factor(fhc_race_group, labels = c('native', 'Asian', 'Black', 
+                                                            'NHPI', 'NHPI', 'White'))) %>%
+  distinct(pat_id, fhc_race_group) %>%
+  mutate(value = TRUE, fhc_race_group = as.character(fhc_race_group)) %>%
+  pivot_wider(names_from = fhc_race_group, values_from = value, names_prefix = 'race_') %>%
+  mutate(across(race_Asian:race_NHPI, ~replace_na(., FALSE))) 
+
+# FHC ethnicity values for race
+fhc_race2 <- ethnicity %>% 
+  left_join(race_dum, by='pat_id') %>%
+  filter(is.na(race_White) & !fhc_value %in% c("Hispanic/Latino", 
+                                                   "Non-Hispanic/Latino",
+                                                   "Unreported/Refused to Report Race",
+                                                   "Unreported/Refused to Report Ethnicity",
+                                                   "Unmapped")) %>%
+  mutate(fhc_value = factor(fhc_value, labels = c('native', 'Asian', 'Black', 'NHPI', 'White'))) %>%
+  distinct(pat_id, fhc_value) %>%
+  mutate(value = TRUE, fhc_value = as.character(fhc_value)) %>%
+  pivot_wider(names_from = fhc_value, values_from = value, names_prefix = 'race_') %>%
+  mutate(across(race_Black:race_NHPI, ~replace_na(., FALSE))) 
+
+# join them and collapse duplicates
+fhc_race <- rbind(fhc_race1, fhc_race2) %>% 
+  distinct() %>%
+  group_by(pat_id) %>%
+  summarise(race_Asian = any(race_Asian),
+            race_Black = any(race_Black),
+            race_White = any(race_White),
+            race_native = any(race_native),
+            race_NHPI = any(race_NHPI), .groups='drop') %>%
+  mutate(race_MENA = FALSE)
+
+# add to race_dum
+race_dum <- rbind(race_dum, fhc_race)
+```
+
+```{r fhc_ethnicity_fill}
+# FHC race values for ethnicity -- n=0 so don't need this
+# race %>% left_join(ethnic_dum, by='pat_id') %>%
+#   filter(is.na(Hispanic) & fhc_race_group == "Hispanic/Latino") %>%
+#   mutate(fhc_race_group = factor(fhc_race_group)) %>%
+#   nrow()
+
+# FHC ethnicity values for ethnicity
+fhc_ethnicity <- ethnicity %>% 
+  left_join(ethnic_dum, by='pat_id') %>%
+  filter(is.na(Hispanic) & fhc_value %in% c("Hispanic/Latino", "Non-Hispanic/Latino")) %>%
+  mutate(fhc_value = factor(fhc_value)) %>%
+  group_by(pat_id) %>%
+  summarise(Hispanic = case_when(sum(fhc_value == "Hispanic/Latino",na.rm=TRUE)>=1~TRUE,
+                                 sum(!is.na(fhc_value))>=1~FALSE), .groups='drop')
+
+# add to ethnicity_dum
+ethnic_dum <- rbind(ethnic_dum, fhc_ethnicity)
+```
+
+```{r join_race_ethnic}
+race_ethnic_dum <- race_dum %>%
+  full_join(ethnic_dum, by='pat_id') %>%
+  rowwise() %>% 
+  mutate(multiple_races = sum(race_White,race_Black,race_Asian,race_native,race_NHPI,race_MENA,
+                              na.rm = T)) %>%
+  ungroup()
+```
+
+```{r race_ethnic_dummy_old, eval=FALSE, include=FALSE}
+race_ethnic_dum <- race_ethnic %>%
+  filter(pat_id %in% pat_cohort$pat_id) %>%
+  group_by(pat_id) %>%
+  summarise(race_Black = case_when(sum(grepl('Black', race_category), na.rm=TRUE)>=1~TRUE,
+                                   sum(grepl('Black', race_category), na.rm=TRUE)==0~FALSE,
+                                   TRUE~NA),
+            race_Asian = sum(grepl('Asian', race_category), na.rm=TRUE)>=1,
+            race_White = sum(grepl('White', race_category), na.rm=TRUE)>=1,
+            race_MENA = sum(grepl('Middle Eastern or North African', race_category), na.rm=TRUE)>=1,
+            race_Native = sum(grepl('Native American, First Peoples, or Alaskan Native', race_category), na.rm=TRUE)>=1,
+            race_NHPI = sum(grepl('Native Hawaiian or Pacific Islander', race_category), na.rm=TRUE)>=1, 
+            Hispanic = case_when(sum(ethnicity_category == 'Hispanic, Latino or Spanish Origin', na.rm=TRUE)>=1~TRUE,
+                                 sum(!is.na(ethnicity_category))>=1~FALSE,
+                                 TRUE~NA),
+            .groups='drop') %>%
+  rowwise() %>% 
+  mutate(multiple_races = sum(c_across(race_Black:race_NHPI), na.rm = T)) %>%
+  ungroup()
 ```
 
 ```{r race_ethnic_summary, results='asis'}
-# look at cross-tab between race and ethnicity
-race_ethnic %>%
-  tableby(formula=~race_final+ethnicity_final, data=., test=FALSE) %>%
+# look at race and ethnicity
+race_ethnic_dum %>%
+  tableby(formula=~race_Black+race_Asian+race_White+race_MENA+race_native+race_NHPI+Hispanic, 
+          data=., test=FALSE) %>%
   summary()
 ```
 
-```{r multiple_races}
-multiple_races <- race_ethnic %>% 
-  select(pat_id, race_final) %>%
-  filter(!is.na(race_final)) %>%
-  distinct() %>%
-  group_by(pat_id) %>%
-  filter(n()>1) %>%
-  arrange(pat_id)
-```
-
-There are `r length(unique(multiple_races$pat_id))` patients who reported multiple races. The common combinations are: 
+There are `r length(which(race_ethnic_dum$multiple_races>1))` patients who reported multiple races. The common combinations are: 
 
 ```{r multiple_race_combos}
-multiple_races %>%
-  group_by(pat_id) %>%
-  mutate(num = row_number()) %>%
-  ungroup() %>%
-  pivot_wider(id_cols = 'pat_id', 
-              names_from = 'num', 
-              names_prefix = 'race_',
-              values_from = 'race_final') %>%
-  group_by(race_1, race_2, race_3, race_4) %>%
+race_ethnic_dum %>%
+  filter(multiple_races>1) %>%
+  select(-Hispanic, -multiple_races) %>%
+  rowwise() %>% 
+  mutate(race_all = paste0(names(.[-1])[c_across(race_White:race_MENA) == TRUE], collapse = ' '),
+         race_all = gsub('race_', '', race_all)) %>%
+  group_by(race_all) %>%
   summarise(count=n(), .groups='drop') %>%
   arrange(desc(count)) %>%
-  select(race_1, race_2, count) %>%
   head(10) %>%
-  kable(caption = 'Top ten racial combinations of multiracial patients') %>% kable_styling()
+  kable(caption = 'Top ten racial combinations of multiracial patients') %>% 
+  kable_styling()
 ```
 
 ```{r merge_race_ethnic}
-race_ethnic_final <- race_ethnic %>% 
-  group_by(pat_id) %>% 
-  filter(n()==1 | (n()>1 & !is.na(race_final))) %>% 
-  group_by(pat_id) %>%
-  reframe(race_groups = case_when(n_distinct(race_final)>1~paste0(unique(race_final),collapse = ', '),
-                                   TRUE~NA),
-            race_final = case_when(n_distinct(race_final)>1~'Multiple races',
-                                   n_distinct(race_final)==1~race_final,
-                                   TRUE~NA),
-            ethnicity_final = case_when(sum(!is.na(ethnicity_final))==1~ethnicity_final,
-                                        sum(!is.na(ethnicity_final))>1 & 
-                                          sum(ethnicity_final=='Hispanic/Latino')>=1~'Hispanic/Latino',
-                                        sum(!is.na(ethnicity_final))>1 & 
-                                          sum(ethnicity_final=='Hispanic/Latino')==0~'Non-Hispanic/Latino',
-                                   TRUE~NA)) %>%
-  distinct() %>%
+# apply multiple race logic
+r1 <- race_ethnic_dum %>% 
+  filter(multiple_races > 1) %>%
+  mutate(race_final = 'Multiple Races') %>%
+  select(pat_id, race_final)
+
+# grab race for those with only one TRUE race
+r2 <- race_ethnic_dum %>% 
+  filter(multiple_races == 1) %>%
+  select(-multiple_races) %>%
+  pivot_longer(cols=contains('race'), names_to='race', names_prefix = 'race_', values_to = 'value') %>%
+  filter(value) %>% 
+  mutate(race_final = race) %>%
+  select(pat_id, race_final)
+
+# join all together
+race_ethnic_final <- race_ethnic_dum %>% 
+  mutate(ethnicity_final = case_when(Hispanic~'Hispanic/Latino',
+                                     !Hispanic~'Non-Hispanic/Latino')) %>%
+  select(pat_id, ethnicity_final) %>%
+  full_join(rbind(r1, r2), by = 'pat_id') %>%
   mutate(race_ethnic_final = case_when(ethnicity_final=='Hispanic/Latino'~ethnicity_final,
-                                       !is.na(race_final)~str_c('NH ', race_final))) 
+                                       !is.na(race_final)~str_c('NH ', race_final)))
 ```
 
 ```{r check_unique_race_ethnic}
 check_unique(race_ethnic_final)
 ```
 
-```{r unique_race_ethnic}
-race_ethnic_final %>% group_by(pat_id) %>% filter(n()>1) %>% arrange(pat_id)
-# keep row with the least missingness
-race_ethnic_unique <- race_ethnic_final %>% 
-  mutate(nmiss = rowSums(is.na(.))) %>% 
-  group_by(pat_id) %>% 
-  filter(nmiss==min(nmiss)) %>% 
-  select(-nmiss)
+Overall coverage of race-ethnicity status at baseline in this cohort: `r print_percent(length(which(!is.na(race_ethnic_final$race_ethnic_final)))/dim(pat_cohort)[1])` of patients.
+
+```{r, eval=FALSE}
+test <- pat_cohort %>% select(pat_id) %>% left_join(race_ethnic_final, by='pat_id')
+
+length(which(is.na(test$race_final)))
+length(which(is.na(test$ethnicity_final)))
+length(which(is.na(test$race_ethnic_final)))
 ```
 
-```{r check_unique_race_ethnic_2}
-check_unique(race_ethnic_unique)
-```
-
-Overall coverage of insurance status at baseline in this cohort: `r print_percent(dim(race_ethnic_unique)[1]/dim(pat_cohort)[1])`% of patients.
 
 ### Hormonal Contraceptive (HC) Use
 
@@ -817,9 +919,19 @@ bmi_clean <- enc_info_baseline %>%
   group_by(pat_id) %>%
   filter(min(abs(margin)) == abs(margin)) %>%
   ungroup() 
+
+# remove outliers (outside of 1.5 times IQR)
+upper <- quantile(bmi_clean$bmi_clean, 0.75) + (1.5*IQR(bmi_clean$bmi_clean, na.rm=TRUE))
+lower <- quantile(bmi_clean$bmi_clean, 0.25) - (1.5*IQR(bmi_clean$bmi_clean, na.rm=TRUE))
 ```
 
-Some patients have more than one BMI at baseline so I take the average of these values to derive their baseline BMI. 
+There are `r length(which(bmi_clean$bmi_clean > upper | bmi_clean$bmi_clean < lower))` BMI observations that are more than 1.5 times greater or 1.5 times less than the IQR and thus deemed outliers and set to NA.
+
+```{r}
+bmi_clean$bmi_clean[which(bmi_clean$bmi_clean > upper | bmi_clean$bmi_clean < lower)] <- NA
+```
+
+Some patients have more than one BMI at baseline so I take the average of these values to derive their baseline BMI.
 
 ```{r unique_bmi_avg}
 bmi_unique <- bmi_clean %>% 
@@ -832,7 +944,48 @@ bmi_unique <- bmi_clean %>%
 check_unique(bmi_unique)
 ```
 
-There are `r length(unique(bmi_unique$pat_id))` patients with a clean BMI at baseline which is `r print_percent(length(unique(bmi_unique$pat_id))/dim(pat_cohort)[1])`. 
+```{r}
+summary(bmi_unique$bmi_baseline)
+```
+
+
+There are `r length(unique(bmi_unique$pat_id[which(!is.na(bmi_unique$bmi_baseline))]))` patients with a clean BMI at baseline which is `r print_percent(length(unique(bmi_unique$pat_id[which(!is.na(bmi_unique$bmi_baseline))]))/dim(pat_cohort)[1])`. 
+
+### Adenomyosis
+
+Adenomyosis will be determined if they have (1) an adenomyosis code which was `determined by biopsy` (2) or at least two codes. I will add a flag for those who have one code that does not meet either conditions.
+
+```{r clean_adeno}
+adeno_dx <- dx_outcomes %>% 
+  filter(grepl('adenomyosis', tolower(dx_name)) & dx_date < '2023-08-01') %>%
+  group_by(pat_id) %>%
+  summarise(adeno_count = n(),
+            adeno_dx_biopsy = sum(dx_name == 'Adenomyosis of uterus determined by biopsy')>=1,
+            first_adeno_dx_date = min(as.Date(dx_date, '%Y-%m-%d'), na.rm=TRUE),
+            .groups='drop') %>%
+  mutate(adeno_final = case_when(adeno_count >= 2 | adeno_dx_biopsy ~ 'Yes',
+                                 TRUE~'Flag'),
+         first_adeno_dx_date = case_when(is.infinite(first_adeno_dx_date)~NA, TRUE~first_adeno_dx_date))
+
+summary(adeno_dx)
+```
+
+Join to patient cohort and add 'No' to those with NA for `adeno_final`. 
+
+```{r join_adeno_pat}
+adeno_cohort <- pat_cohort %>% 
+  select(pat_id, index_enc_date) %>%
+  left_join(adeno_dx, by='pat_id') %>%
+  mutate(adeno_ever = ifelse(is.na(adeno_final), 'No', adeno_final),
+         adeno_fu = adeno_final == 'Yes' & first_adeno_dx_date > index_enc_date,
+         adeno_baseline = adeno_final == 'Yes' & first_adeno_dx_date <= index_enc_date)
+```
+
+```{r check_unique_adeno}
+check_unique(adeno_cohort)
+```
+
+There are `r length(which(adeno_cohort$adeno_ever == 'Yes'))` patients with an adenomyosis diagnosis at any point and `r length(which(adeno_cohort$adeno_baseline))` patients who are diagnosed with adenomyosis prior to baseline and `r length(which(adeno_cohort$adeno_fu))` patients who are diagnosed with adenomyosis during follow-up.
 
 ### {.unnumbered}
 
@@ -845,9 +998,10 @@ pat_cohort_covars <- pat_cohort %>%
             , by='pat_id') %>%
   left_join(insur_clean_unique %>% select(-enc_date), by='pat_id') %>%
   left_join(ART_clean, by='pat_id') %>%
-  left_join(race_ethnic_unique, by='pat_id') %>%
+  left_join(race_ethnic_final, by='pat_id') %>%
   left_join(hc_baseline_clean, by='pat_id') %>%
   left_join(parity_clean, by='pat_id') %>%
+  left_join(adeno_cohort %>% select(-index_enc_date), by='pat_id') %>%
   left_join(language_clean %>% select(pat_id, language_eng_sp, language_eng), by='pat_id') %>%
   left_join(marital_clean %>% select(pat_id, marital_status_final), by='pat_id') %>%
   left_join(bmi_unique, by='pat_id') %>%
@@ -898,7 +1052,7 @@ summary(tableby(~employ_simple_final + insur_status + race_ethnic_final + langua
 This is a cross-tabulation of race and ethnicity if we do not merge the two variables. 
 ```{r race_ethnic_crosstab, results='asis'}
 # look at cross-tab between race and ethnicity
-race_ethnic_unique %>%
+race_ethnic_final %>%
   tableby(formula=ethnicity_final~race_final, data=., test=FALSE) %>%
   summary()
 ```
@@ -908,13 +1062,17 @@ race_ethnic_unique %>%
 ```{r other_table, results='asis'}
 other_labs <- list(ART_use_baseline = 'ART Use prior to baseline', 
                  ART_use_fu = 'ART Use during follow-up', 
-                 HC_status = 'Hormonal Contraceptive use')
+                 HC_status = 'Hormonal Contraceptive use',
+                 adeno_fu = 'Adenomyosis Dx during follow-up',
+                 adeno_baseline = 'Adenomyosis Dx prior to baseline')
 # make all NA's FALSE (assumption)
 pat_cohort_covars <- pat_cohort_covars %>%
   mutate(ART_use_baseline = ifelse(is.na(ART_use_baseline), FALSE, ART_use_baseline),
          ART_use_fu = ifelse(is.na(ART_use_fu), FALSE, ART_use_fu),
-         HC_status = ifelse(is.na(HC_status), FALSE, HC_status),)
-summary(tableby(~ART_use_baseline + ART_use_fu + HC_status, data=pat_cohort_covars),
+         HC_status = ifelse(is.na(HC_status), FALSE, HC_status),
+         adeno_fu = ifelse(is.na(adeno_fu), FALSE, adeno_fu),
+         adeno_baseline = ifelse(is.na(adeno_baseline), FALSE, adeno_baseline))
+summary(tableby(~ART_use_baseline + ART_use_fu + HC_status + adeno_fu + adeno_baseline, data=pat_cohort_covars),
         labelTranslations = other_labs)
 ```
 
@@ -926,7 +1084,6 @@ summary(tableby(site_baseline~employ_simple_final + insur_status + race_ethnic_f
                 na.action = na.tableby(FALSE)), labelTranslations = ses_labs)
 ```
 
-
 Patients who only attend outpatient clinics in their baseline year appear to most closely resemble Tisch patients. They are predominantly privately insured, employed, non-Hispanic White (highest proportion of all sites), English speakers, and native (although among the highest missingness for all SES variables).
 
 ### {.unnumbered}
@@ -937,9 +1094,9 @@ Patients who only attend outpatient clinics in their baseline year appear to mos
 
 ```{r missingness_percent}
 gg_miss_var(pat_cohort_covars %>% 
-              select(-c(pat_id, race_groups, employ_source, employ_margin, 
-                        employ_clean, parity_final, prior_delivery, race_final, ethnicity_final,
-                        contains('date'), HC_type)), 
+              select(-c(pat_id, employ_source, employ_margin, employ_clean, parity_final, prior_delivery, race_final,
+                        ethnicity_final,contains('date'), HC_type, adeno_count, adeno_dx_biopsy, first_adeno_dx_date, 
+                        adeno_final)), 
             show_pct = TRUE)
 ```
 
@@ -949,9 +1106,9 @@ Because nativity missingess is so high, we will not use it for future missingnes
 
 ```{r missingness_pattern}
 gg_miss_upset(pat_cohort_covars %>% 
-                select(-c(pat_id, race_groups, employ_source, employ_margin, parity_final, prior_delivery,
-                          employ_clean, race_final, ethnicity_final, nativity, 
-                          contains('date'), HC_type)))
+                select(-c(pat_id, employ_source, employ_margin, parity_final, prior_delivery,
+                          employ_clean, race_final, ethnicity_final, nativity, adeno_final,
+                          contains('date'), HC_type, adeno_count, adeno_dx_biopsy, first_adeno_dx_date)))
 ```
 
 ```{r insurance_language_missing, results='asis'}
@@ -972,11 +1129,13 @@ pat_cohort_covars$complete <- complete.cases(pat_cohort_covars[,c("insur_status"
                                                                   "hcu_baseline", 
                                                                   "site_baseline",
                                                                   "employ_simple_final",
-                                                                  "parity_binary")])
+                                                                  "parity_binary",
+                                                                  "adeno_fu", 
+                                                                  "adeno_baseline")])
 
 summary(tableby(complete ~ site_baseline + age_20160801 + bmi_baseline + parity_binary + insur_status +
                   race_ethnic_final + language_eng_sp + marital_status_final + employ_simple_final +
-                  ART_use_baseline + HC_status + hcu_baseline, 
+                  ART_use_baseline + HC_status + hcu_baseline + adeno_fu + adeno_baseline, 
                 data=pat_cohort_covars, na.action = na.tableby(FALSE)),
         labelTranslations = c(cont_labs, ses_labs, other_labs))
 ```
@@ -993,4 +1152,5 @@ In terms of notable differences, incomplete cases are more likely to:
 ```{r}
 ## write out final table with covariates
 write.csv(pat_cohort_covars, 'Data/Derived/clean_covariates.csv', row.names=FALSE)
+write.csv(race_ethnic_dum, 'Data/Derived/clean_race_ethnicity_dummy.csv', row.names=FALSE)
 ```
