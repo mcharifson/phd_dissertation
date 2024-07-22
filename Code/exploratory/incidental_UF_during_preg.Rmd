@@ -1,0 +1,314 @@
+---
+title: "Cohort extraction: Incidental UF during pregnancy"
+author: "Mia Charifson"
+date: "2024-07-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+knitr::opts_knit$set(root.dir = '/Users/miacharifson/Library/CloudStorage/OneDrive-NYULangoneHealth/Charifson Dissertation/')
+
+library(tidyverse)
+library(ggplot2)
+library(lubridate)
+library(tableone)
+library(arsenal)
+library(readxl)
+library(ggpubr)
+library(corrplot)
+library(data.table)
+```
+
+# Poster cohort extraction
+
+Last updated on `r lubridate::today()`.
+
+The purpose of this document is to produce the cohorts for conference posters related to the NYULH UF/Endo EHR cohort.
+
+- Robyn: Incidental fibroid diagnosis during pregnancy 
+
+# Cleaning relevant datasets
+
+Load in all tables
+```{r load}
+pat_cohort <- read.csv('Data/Derived/pat_cohort_w_censoring.csv') 
+uf_endo <- read.csv('Data/Epic/table3_dx_outcomes.csv')
+uf_endo_filled_dates <-read.csv('Data/Epic/fill_missing_dx_dates.csv')
+imaging_dx <- read.csv('Data/Epic/table3_dx_imaging.csv') 
+imaging_orders <- read.csv('Data/Epic/table4_proc_imaging.csv') 
+surgery_orders <- read.csv('Data/Epic/table4_proc_surgery.csv') 
+surgery_records <- read.csv('Data/Epic/table4_surgery.csv')
+
+uf_cohort_clean <- read.csv('Data/Derived/uf_all_hints.csv')
+covars <- read.csv('Data/Derived/clean_covariates.csv')
+race_ethnic <- read.csv('Data/Derived/clean_race_ethnicity_dummy.csv')
+ob_dx <- read.csv('Data/Epic/table6_ob_linked_dx.csv')
+ob_preg <- read.csv('Data/Epic/table6_ob_linked_preg.csv')
+pregnancy_info <- read.csv('Data/Derived/Poster Data/all_pregnancies_20240719.csv')
+hc_use_dx <- read.csv('Data/Epic/table3_dx_HCuse.csv')
+hc_use_social <- read.csv('Data/Epic/table6_social_HCuse.csv')
+```
+
+Subset tables to the eligible cohort
+```{r subset_inputs}
+# Combine tables that need combining
+uf_endo_cohort <- uf_endo %>%
+  mutate(dx_date = strptime(dx_date, "%Y-%m-%d %H:%M:%S")) %>%
+  ## remove those missing a dx date
+  filter(!is.na(dx_date)) %>%
+  ## add in filled dx_date where missing
+  bind_rows(uf_endo_filled_dates %>% 
+              filter(!is.na(dx_date)) %>%
+              mutate(dx_date_filled = strptime(dx_date_filled, "%Y-%m-%d %H:%M:%S"),
+                     dx_date = strptime(dx_date, "%Y-%m-%d %H:%M:%S")) %>%
+              mutate(dx_date = case_when(is.na(dx_date)~dx_date_filled, TRUE~dx_date),
+                     pat_enc_csn_id = as.character(pat_enc_csn_id))) %>%
+  # fill in missing index_enc_date
+  inner_join(pat_cohort %>% select(pat_id, index_enc_date), by = 'pat_id')
+  
+## combine all imaging
+imaging_all <- imaging_dx %>%
+  mutate(imaging_date = strptime(dx_date, "%Y-%m-%d %H:%M:%S")) %>%
+  #mutate(pat_enc_csn_id = as.numeric(pat_enc_csn_id)) %>%
+  mutate(event_name = dx_name,
+         event_type = paste0('Imaging-', dx_type)) %>%
+  select(pat_id, imaging_date, event_name, event_type) %>%
+  bind_rows(imaging_orders %>% 
+              mutate(imaging_date = as.Date(ordering_date)) %>%
+              mutate(event_name = procedure_name,
+                     event_type = 'Imaging Order') %>%
+              select(pat_id, imaging_date, event_name, event_type)) %>%
+  filter(pat_id %in% pat_cohort$pat_id)
+
+## combine all surgery
+surgery_all <- surgery_records %>%
+  mutate(surgery_date = strptime(surgery_date, "%Y-%m-%d %H:%M:%S")) %>%
+  full_join(surgery_orders %>% mutate(surgery_date = as.Date(ordering_date)), 
+            by=c('pat_id', 'pat_enc_csn_id', 'surgery_date', 'procedure_name',
+                                 'procedure_code_type', 'procedure_code')) %>%
+  mutate(type = ifelse(!is.na(performed), 'Surgery record', 'Surgery order')) %>%
+  select(-ordering_date) %>%
+  filter(pat_id %in% pat_cohort$pat_id)
+```
+
+Collapse to unique dates for each input type (dx, imaging, surgery)
+```{r subset_unique_dates}
+uf_other_codes <- c('D21.9', 'O34.10', 'O34.11', 'O34.12', 'O34.13', 'IMO0001', 'N93.9', 'D28.1', 'O46.8X1')
+uf_names <- 'fibroid|leiomyoma|uterine myoma|uterine fibromyoma'
+
+uf_dx<- uf_endo_cohort %>% 
+  filter(!is.na(dx_date)) %>%
+  filter(dx_date <= '2023-08-01') %>% # filter to end of FU
+  filter(grepl('D25', icd10) | (icd10 %in% uf_other_codes & grepl(uf_names, tolower(dx_name)))) %>%
+  rename(date=dx_date) %>%
+  select(-referral_id, -icd10, -dx_date_filled, -pat_enc_csn_id)
+
+uf_dx_unique <- uf_endo_cohort %>% 
+  filter(!is.na(dx_date)) %>%
+  filter(dx_date <= '2023-08-01') %>% # filter to end of FU
+  filter(grepl('D25', icd10) | (icd10 %in% uf_other_codes & grepl(uf_names, tolower(dx_name)))) %>%
+  rename(date=dx_date) %>%
+  select(-referral_id, -icd10, -dx_date_filled, -pat_enc_csn_id) %>%
+  group_by(pat_id, date) %>%
+  summarise(event_name = paste0(unique(dx_name), collapse=', '),
+            event_type = paste0(unique(dx_type), collapse=', '),
+            .groups='drop')
+
+imaging_unique <- imaging_all %>% 
+  mutate(date=as.Date(imaging_date)) %>%
+  group_by(pat_id, date)  %>%
+  summarise(event_name = paste0(unique(event_name), collapse=', '),
+            event_type = paste0(unique(event_type), collapse=', '),
+            .groups='drop')
+
+surgery_unique <- surgery_all %>% 
+  mutate(date = as.Date(surgery_date)) %>%
+  group_by(pat_id, date) %>%
+  summarise(event_name = paste0(unique(procedure_name), collapse=', '),
+            event_type = paste0(unique(type), collapse=', '),
+            .groups='drop')
+```
+
+Bind all inputs together
+```{r final_inputs}
+uf_all_long <- bind_rows(uf_dx_unique, imaging_unique, surgery_unique) %>%
+  distinct() %>%
+  filter(date <= '2023-08-01') %>% # filter to end of FU
+  arrange(pat_id, date)
+```
+
+Extract the time between any diagnostic procedure and the closest date of a diagnosis code
+```{r procedure_dx_sequelae, warnings=FALSE}
+procedure_df <- uf_all_long
+setDT(procedure_df)
+# indexing which rows are procedures
+procedure_df$is_procedure <- grepl('Imaging|Surgery', procedure_df$event_type)
+# indexing which rows are dx (ignore imaging Dx for now)
+procedure_df$is_diagnosis <- grepl('Diagnosis|Problem|List|History', procedure_df$event_type) & !grepl('Imaging',procedure_df$event_type)
+# rearrange so if a procedure and dx happen on the same day the procedure goes first
+procedure_df <- arrange(procedure_df, pat_id, date, is_diagnosis, is_procedure)
+# get the index of the next row that is a dx when the row is a procedure
+procedure_df[,next_dx_index:=zoo::na.locf(NA^(!is_diagnosis)*.I, fromLast=T, na.rm=F)*NA^(!is_procedure), by=pat_id]
+# find time difference between the date of procedure and the next Dx date
+procedure_df <- procedure_df[,next_dx_time_interval:=difftime(date[next_dx_index], date, units="days")]
+procedure_df <- procedure_df[,next_dx_name:=event_name[next_dx_index]]
+procedure_df <- procedure_df[,next_dx_type:=event_type[next_dx_index]]
+procedure_df <- procedure_df[,next_dx_date:=date[next_dx_index]]
+# convert to data frame
+procedure_df <- as.data.frame(procedure_df) %>%
+  mutate(method = case_when(grepl('Surgery', event_type)~"Surgery",
+                            grepl('Imaging', event_type)~"Imaging",
+                            TRUE~NA),
+         confirmed_6months = (as.numeric(next_dx_time_interval)<180),
+         confirmed_ever_prevalent = grepl('List|History', next_dx_type))
+```
+
+- Cohort description: patients whose first fibroid code is one during pregnancy between 2016 and 2023
+- Variables needed: patient ID, date of first fibroid code, number of fibroid codes after first one, date of each fibroid code, if they ever receive surgical intervention, date of surgical intervention, do they complicate a later pregnancy, patient age, race/ethnicity, parity, insurance, site of surgical intervention, language
+- Caveat: we may miss UF diagnoses during pregnancy that are not indicated by the diagnosis code itself. Since pregnancy windows are not accurately tracked in EHR, this is difficult to determine and a limitation of this methodology.
+
+Who has a pregnancy code during observation period:
+```{r}
+pat_w_preg <- pregnancy_info %>% 
+  inner_join(pat_cohort, by='pat_id') %>%
+  left_join(uf_cohort_clean, by='pat_id') %>%
+  filter(est_preg_start < first_dx_date | is.na(first_dx_date)) %>%
+  distinct(pat_id, preg_id, est_preg_start, preg_end_final, preg_end_source, age_20160801)
+```
+
+Pregnancy-related UF ICD-codes:
+```{r}
+uf_pregnancy <- 'pregnancy|partum|antenatal'
+
+uf_preg_dx <- uf_dx_unique %>% 
+  filter(!grepl("History", event_type)) %>%
+  inner_join(pat_w_preg, by='pat_id') %>%
+  filter(date > est_preg_start & date < preg_end_final) %>%
+  group_by(preg_id) %>%
+  summarise(preg_uf_dx = TRUE, 
+            first_preg_uf_dx_date = min(date), 
+            count_uf_dx_in_preg = n_distinct(date),
+            .groups='drop')
+```
+
+Join with patients with any pregnancy during follow-up:
+```{r}
+uf_preg_cohort <- pat_w_preg %>%
+  left_join(uf_preg_dx, by='preg_id') %>%
+  mutate(preg_uf_dx = ifelse(is.na(preg_uf_dx), FALSE, preg_uf_dx))
+```
+
+There are `r dim(uf_preg_cohort)[1]` patients (`r round(dim(uf_preg_cohort)[1]/dim(pat_cohort)[1]*100,2)`% of eligible patients) with any pregnancy-related ICD-code during the observation period. 
+
+Of these, `r length(which(uf_preg_cohort$preg_uf_dx))` patients had pregnancy related fibroid codes during the observation period (`r round(length(which(uf_preg_cohort$preg_uf_dx))/dim(uf_preg_cohort)[1]*100, 2)`%). 
+
+Do they ever have another UF code, how many they have (at least one year after) later (excluding medical Hx codes):
+```{r}
+## need count of UF codes more than a year after the first one
+uf_preg_later_dx <- uf_dx %>% 
+  inner_join(uf_preg_cohort %>% filter(preg_uf_dx) %>% select(pat_id, preg_id, first_preg_uf_dx_date), by='pat_id') %>%
+  filter(dx_type != 'Medical History') %>%
+  filter(difftime(date, first_preg_uf_dx_date, unit='days') > 365) %>%
+  select(preg_id, first_preg_uf_dx_date, date, dx_name, dx_type) %>%
+  mutate(time_to_next_dx = as.numeric(difftime(date, first_preg_uf_dx_date, unit='days'))) %>%
+  group_by(preg_id) %>%
+  summarise(count_nonpreg_uf_dx = sum(!grepl(uf_pregnancy, dx_name)), 
+            count_preg_uf_dx = sum(grepl(uf_pregnancy, dx_name)), 
+            .groups='drop') %>%
+  mutate(later_nonpreg_uf_dx = count_nonpreg_uf_dx>0,
+         later_preg_uf_dx = count_preg_uf_dx>0)
+
+summary(uf_preg_later_dx)
+```
+
+Link HC use to date of preg UF date: 
+```{r clean_hc_social}
+hc_social_clean <- hc_use_social %>% 
+  inner_join(uf_preg_cohort %>% select(pat_id, preg_id, est_preg_start), by='pat_id') %>%
+  mutate(contact_date = as.Date(contact_date), est_preg_start = as.Date(est_preg_start)) %>%
+  filter(contact_date <= est_preg_start) %>% 
+  group_by(preg_id) %>%
+  mutate(HC_use_ever_prior = TRUE,
+         HC_use_year_prior = abs(difftime(contact_date, est_preg_start, units='days'))<365,
+         source = 'social_history')
+
+#length(unique(hc_social_clean$pat_id[which(hc_social_clean$HC_status)]))
+```
+
+```{r clean_hc_dx}
+hc_dx_clean <- hc_use_dx %>% 
+  filter(!grepl('condom|barrier', tolower(dx_name))) %>%
+  inner_join(uf_preg_cohort %>% select(pat_id, preg_id, est_preg_start), by='pat_id') %>%
+  mutate(dx_date = as.Date(dx_date), est_preg_start = as.Date(est_preg_start)) %>%
+  arrange(pat_id, dx_date) %>%
+  mutate(HC_enc_type = case_when(grepl('Z30.432', icd10)~'end',
+                                 grepl('removal|pregnancy', tolower(dx_name)) & 
+                                   !grepl('reinsertion', tolower(dx_name))~'end',
+                                 TRUE~'not end'),
+         hc_type = case_when(grepl('Z30.011|Z30.41', icd10)~'pill',
+                                grepl('Z30.014|Z30.43[0-3]', icd10)~'iud',
+                                grepl('Z30.013|Z30.42', icd10)~'injectable',
+                                grepl('Z30.015|Z30.44', icd10)~'ring',
+                                grepl('Z30.016|Z30.45', icd10)~'patch',
+                                grepl('Z30.017|Z30.46', icd10)~'implant',
+                                grepl('Z30.012', icd10)~'emergency',
+                                grepl('bcp|oral|pill', tolower(dx_name))~'pill',
+                                grepl('iud|intrauterine|uterin contracep dev',
+                                      tolower(dx_name))~'iud',
+                                grepl('depo|inject|medroxy', tolower(dx_name))~'injectable',
+                                grepl('ring|intravaginal', tolower(dx_name)) &
+                               !grepl('monitoring|occurring|during', dx_name)~'ring',
+                                grepl('patch|transdermal', tolower(dx_name))~'patch',
+                                grepl('implant|implanon|subdermal|nexplanon|norplant',
+                                      tolower(dx_name))~'implant',
+                                TRUE~'other')) %>% 
+  filter(hc_type != 'emergency') %>%
+  filter(dx_date <= est_preg_start) %>% 
+  group_by(preg_id) %>%
+  mutate(HC_use_ever_prior = TRUE,
+         HC_use_year_prior = abs(difftime(dx_date, est_preg_start, units='days'))<365,
+         source = 'diagnosis_codes', .groups='drop') %>%
+  ungroup()
+```
+
+```{r join_hc}
+hc_preg_clean <- hc_social_clean %>%
+  select(pat_id, preg_id, HC_use_ever_prior, HC_use_year_prior) %>%
+  bind_rows(hc_dx_clean %>% select(pat_id, preg_id, HC_use_ever_prior, HC_use_year_prior)) %>% 
+  distinct()
+
+#summary(hc_preg_clean)
+```
+
+Join parity to preg UF code date: 
+```{r}
+parity_clean <- ob_preg %>% 
+  inner_join(uf_preg_cohort %>% select(pat_id, preg_id, est_preg_start), by='pat_id') %>%
+  filter(between(as.numeric(as.Date(contact_date)-as.Date(est_preg_start)), 0, 365)) %>%
+  mutate(parity_final = coalesce(ob_parity, ob_live_births, ob_full_term)) %>%
+  select(-contains('ob')) %>%
+  mutate(parity_binary = case_when(parity_final == 0~'nulliparous',
+                                   parity_final >= 1~'parous')) %>%
+  distinct(pat_id, preg_id, parity_final, parity_binary)
+```
+
+Cohort summary:
+```{r}
+uf_preg_cohort_final <- uf_preg_cohort %>%
+  left_join(hc_preg_clean %>% select(-pat_id), by='preg_id') %>%
+  left_join(parity_clean %>% select(-pat_id), by='preg_id') %>%
+  left_join(uf_preg_later_dx, by='preg_id') %>%
+  left_join(covars %>% select(pat_id, race_ethnic_final), by='pat_id') %>%
+  mutate_if(is.logical, ~ifelse(is.na(.), FALSE, .)) %>%
+  mutate(parity_final = as.numeric(parity_final))
+  
+CreateTableOne(data=uf_preg_cohort_final, includeNA=TRUE, strata='preg_uf_dx', 
+               vars=c('age_20160801', 'race_ethnic_final', 'HC_use_ever_prior',
+                      'HC_use_year_prior','parity_binary', 'parity_final'))
+```
+```{r}
+# write out file
+write.csv(uf_preg_cohort_final, 'NYULH UF-Endo Cohort-Projects/Robyn/data/pregnancy_cohort_20240720.csv')
+```
+

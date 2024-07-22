@@ -1,0 +1,282 @@
+---
+title: "Identify pregnancies during FU"
+author: "Mia Charifson"
+date: "2024-07-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+knitr::opts_knit$set(root.dir = '/Users/miacharifson/Library/CloudStorage/OneDrive-NYULangoneHealth/Charifson Dissertation/')
+
+library(tidyverse)
+library(ggplot2)
+library(lubridate)
+library(tableone)
+library(arsenal)
+library(readxl)
+library(ggpubr)
+library(corrplot)
+library(data.table)
+```
+
+```{r}
+pat_cohort <- read.csv('Data/Derived/pat_cohort_w_censoring.csv') 
+uf_cohort_clean <- read.csv('Data/Derived/uf_all_hints.csv')
+pregnancy_info <- read.csv('Data/Epic/table3_diagnosis_new_preg.csv')
+```
+
+```{r}
+pregnancy_clean <- pregnancy_info %>%
+  filter(pat_id %in% pat_cohort$pat_id) %>%
+  mutate(event_date = stringr::str_extract(event_date, '(\\d{1,2}/\\d{1,2}/\\d{4})')) %>%
+  mutate(event_date = as.Date(event_date, "%m/%d/%Y"))
+```
+
+# Pregnancy ends
+
+Sources: 
+
+- ICD codes for deliveries
+- ICD codes for prenatal visits that mention gestational weeks
+- ICD codes for prenatal visits that mention trimester
+- ICD codes for postpartum appointments
+
+Unfortunately, CPT codes for deliveries are not found in our data for some reason.
+
+## Grab pregnancy ends
+
+```{r}
+delivery_dates <- pregnancy_clean %>% 
+  filter(grepl('deliver|NVD|birth|iveborn|Deliver|Term pregnancy|CESAREAN SECTION|Labor', event) & 
+           !grepl('antepartum|not yet delivered|revious cesarean|ostpartum|labor and delivery', event)) %>%
+  mutate(preg_end_date = event_date) %>% 
+  distinct(pat_id, event_date, preg_end_date) %>%
+  mutate(source = 'delivery_code')
+```
+
+## Grab expected pregnancy ends based on GA appts
+
+```{r}
+edd_gestation_dates <- pregnancy_clean %>% 
+  filter(grepl('week', event) & !grepl('del|Del', event)) %>%
+  mutate(gest_weeks = stringr::str_extract(event, '(\\d{1,2})')) %>%
+  mutate(gest_weeks = as.numeric(gest_weeks)) %>%
+  # assume 40 weeks preg_end unless already greater than 40 in which case assume 43
+  mutate(preg_end_date = case_when(gest_weeks < 40~event_date %m+% days((40-gest_weeks)*7),
+                                   gest_weeks >= 40~event_date %m+% days((43-gest_weeks)*7))) %>%
+  distinct(pat_id, event_date, preg_end_date) %>%
+  mutate(source = 'estimated_due_date_GA')
+```
+
+## Grab expected pregnancy ends based on trimester
+
+```{r}
+edd_trimester_dates <- pregnancy_clean %>% 
+  filter(grepl("trimester", event) & !grepl("unspecified trimester", event)) %>%
+  # assume the middle of the trimester in terms of GA and then add accordingly, except 1st trimester assume 12 weeks
+  mutate(assumed_gest_weeks = case_when(grepl("irst trimester", event)~12,
+                                        grepl("econd trimester", event)~20,
+                                        grepl("hird trimester", event)~33),
+         preg_end_date = event_date %m+% days((40-assumed_gest_weeks)*7)) %>%
+  distinct(pat_id, event_date, preg_end_date) %>%
+  mutate(source = 'estimated_due_date_trimester')
+```
+
+## Grab expected pregnancy ends based on postpartum appointment
+
+```{r}
+postpartum_dates <- pregnancy_clean %>% 
+  filter(grepl("ostpartum", event)) %>%
+  # assume the postpartum appointment is 3 weeks after delivery
+  mutate(preg_end_date = event_date %m+% days(-21)) %>%
+  distinct(pat_id, event_date, preg_end_date) %>%
+  mutate(source = 'estimated_due_date_postpartum')
+```
+
+## Find overlapping pregnancy ends (take delivery code over appt code)
+
+If two pregnancy dates are within 18 weeks, consider them overlapping. Prioritize end date as follows:
+
+- Delivery date
+- EDD from GA
+- EDD from trimester
+
+First, filter each table individually
+```{r}
+delivery_dates_unique <- delivery_dates %>%
+  arrange(pat_id, preg_end_date) %>%
+  group_by(pat_id) %>%
+  # always take the earliest delivery date
+  mutate(margin = as.numeric(difftime(preg_end_date, lag(preg_end_date), unit='days'))) %>%
+  ungroup() %>%
+  filter(abs(margin) > 280 | is.na(margin)) %>%
+  distinct(pat_id, preg_end_date, source)
+
+gestation_dates_unique <- edd_gestation_dates %>%
+  arrange(pat_id, preg_end_date) %>%
+  group_by(pat_id) %>%
+  # always take the earliest delivery date
+  mutate(margin = as.numeric(difftime(preg_end_date, lag(preg_end_date), unit='days'))) %>%
+  ungroup() %>%
+  filter(abs(margin) > 280 | is.na(margin)) %>%
+  distinct(pat_id, preg_end_date, source)
+
+trimester_dates_unique <- edd_trimester_dates %>%
+  arrange(pat_id, preg_end_date) %>%
+  group_by(pat_id) %>%
+  # always take the earliest delivery date
+  mutate(margin = as.numeric(difftime(preg_end_date, lag(preg_end_date), unit='days'))) %>%
+  ungroup() %>%
+  filter(abs(margin) > 280 | is.na(margin)) %>%
+  distinct(pat_id, preg_end_date, source)
+
+postpartum_dates_unique <- postpartum_dates %>%
+  arrange(pat_id, preg_end_date) %>%
+  group_by(pat_id) %>%
+  # always take the earliest delivery date
+  mutate(margin = as.numeric(difftime(preg_end_date, lag(preg_end_date), unit='days'))) %>%
+  ungroup() %>%
+  filter(abs(margin) > 280 | is.na(margin)) %>%
+  distinct(pat_id, preg_end_date, source)
+```
+
+## Join together
+
+```{r}
+all_preg_dates <- rbind(delivery_dates_unique, gestation_dates_unique, 
+                        trimester_dates_unique, postpartum_dates_unique) %>%
+  mutate(preg_year = year(preg_end_date))
+
+print(paste0('Based on unique patient_id and year combinations, we expected roughly ', 
+             all_preg_dates %>% distinct(pat_id, preg_year) %>% nrow(),
+             ' unique pregnancies in this cohort.'))
+
+print(paste0('In 2017, there were 6013 deliveries in NYU hospitals. In our data, we see roughly ', 
+             all_preg_dates %>% filter(preg_year == 2017) %>% distinct(pat_id) %>% nrow(),
+             ' unique patients with deliveries in 2017 this cohort.'))
+```
+
+## Look at which rows are not yet cleaned
+
+```{r}
+# checked and confirmed we cannot get pregnancy end date from these
+pregnancy_clean %>% 
+  filter(!pat_id %in% all_preg_dates$pat_id) %>%
+  distinct(event)
+```
+
+# Join each table stepwise in order of source priority
+
+```{r}
+all_preg_dates %>%
+  arrange(pat_id, preg_end_date) %>%
+  group_by(pat_id) %>%
+  # always take the earliest delivery date
+  mutate(margin = as.numeric(difftime(preg_end_date, lag(preg_end_date), unit='days'))) %>%
+  ungroup() %>%
+  filter(abs(margin) > 280 | is.na(margin)) %>%
+  distinct(pat_id, preg_end_date, source)
+```
+
+
+```{r}
+join1 <- delivery_dates_unique %>% 
+  full_join(gestation_dates_unique, by='pat_id', suffix=c('_1', '_2')) %>%
+  mutate(margin = as.numeric(difftime(preg_end_date_1, preg_end_date_2, unit='days'))) %>%
+  mutate(preg_end_final = case_when(abs(margin)<280~pmin(preg_end_date_1, preg_end_date_2),
+                                    is.na(margin)~coalesce(preg_end_date_1, preg_end_date_2),
+                                    TRUE~preg_end_date_1),
+         source_final = case_when(abs(margin)<280 | is.na(margin)~coalesce(source_1, source_2),
+                                    TRUE~source_1)) %>%
+  distinct(pat_id, preg_end_final, source_final) %>%
+  arrange(pat_id, preg_end_final)
+
+join2 <- delivery_dates_unique %>% 
+  full_join(trimester_dates_unique, by='pat_id', suffix=c('_1', '_2')) %>%
+  mutate(margin = as.numeric(difftime(preg_end_date_1, preg_end_date_2, unit='days'))) %>%
+  mutate(preg_end_final = case_when(abs(margin)<280~pmin(preg_end_date_1, preg_end_date_2),
+                                    is.na(margin)~coalesce(preg_end_date_1, preg_end_date_2),
+                                    TRUE~preg_end_date_1),
+         source_final = case_when(abs(margin)<280 | is.na(margin)~coalesce(source_1, source_2),
+                                    TRUE~source_1)) %>%
+  distinct(pat_id, preg_end_final, source_final) %>%
+  arrange(pat_id, preg_end_final)
+
+join3 <- join1 %>% 
+  full_join(join2, by='pat_id', suffix=c('_1', '_2')) %>%
+  mutate(margin = as.numeric(difftime(preg_end_final_1, preg_end_final_2, unit='days'))) %>%
+  mutate(preg_end_final = case_when(abs(margin)<280~pmin(preg_end_final_1, preg_end_final_2),
+                                    is.na(margin)~coalesce(preg_end_final_1, preg_end_final_2),
+                                    TRUE~preg_end_final_1),
+         source_final = case_when(abs(margin)<280 | is.na(margin)~coalesce(source_final_1, source_final_2),
+                                    TRUE~source_final_1)) %>%
+  distinct(pat_id, preg_end_final, source_final) %>%
+  arrange(pat_id, preg_end_final)
+
+join4 <- gestation_dates_unique %>% 
+  full_join(postpartum_dates_unique, by='pat_id', suffix=c('_1', '_2')) %>%
+  mutate(margin = as.numeric(difftime(preg_end_date_1, preg_end_date_2, unit='days'))) %>%
+  mutate(preg_end_final = case_when(abs(margin)<280~pmin(preg_end_date_1, preg_end_date_2),
+                                    is.na(margin)~coalesce(preg_end_date_1, preg_end_date_2),
+                                    TRUE~preg_end_date_1),
+         source_final = case_when(abs(margin)<280 | is.na(margin)~coalesce(source_1, source_2),
+                                    TRUE~source_1)) %>%
+  distinct(pat_id, preg_end_final, source_final) %>%
+  arrange(pat_id, preg_end_final)
+
+join5 <- join3 %>% 
+  full_join(join4, by='pat_id', suffix=c('_1', '_2')) %>%
+  mutate(margin = as.numeric(difftime(preg_end_final_1, preg_end_final_2, unit='days'))) %>%
+  mutate(preg_end_final = case_when(abs(margin)<280~pmin(preg_end_final_1, preg_end_final_2),
+                                    is.na(margin)~coalesce(preg_end_final_1, preg_end_final_2),
+                                    TRUE~preg_end_final_1),
+         source_final = case_when(abs(margin)<280 | is.na(margin)~coalesce(source_final_1, source_final_2),
+                                    TRUE~source_final_1)) %>%
+  distinct(pat_id, preg_end_final, source_final) %>%
+  arrange(pat_id, preg_end_final)
+
+join6 <- join5 %>% 
+  full_join(trimester_dates_unique, by='pat_id') %>%
+  mutate(margin = as.numeric(difftime(preg_end_final, preg_end_date, unit='days'))) %>%
+  mutate(preg_end_final = case_when(abs(margin)<280~pmin(preg_end_final, preg_end_date),
+                                    is.na(margin)~coalesce(preg_end_final, preg_end_date),
+                                    TRUE~preg_end_final),
+         source_final = case_when(abs(margin)<280 | is.na(margin)~coalesce(source_final, source),
+                                    TRUE~source_final)) %>%
+  distinct(pat_id, preg_end_final, source_final) %>%
+  arrange(pat_id, preg_end_final)
+```
+
+## Filter to unique pregnancies
+
+```{r}
+join_final_unique <- join6 %>%
+  arrange(pat_id, preg_end_final) %>%
+  group_by(pat_id) %>%
+  # always take the earliest delivery date
+  mutate(margin = as.numeric(difftime(preg_end_final, lag(preg_end_final), unit='days'))) %>%
+  ungroup() %>%
+  filter(abs(margin) > 280 | is.na(margin)) %>%
+  distinct(pat_id, preg_end_final, source_final)
+
+table(join_final_unique$source_final)
+```
+
+## Output table with estimated preg_start and preg_end
+
+```{r}
+df <- join_final_unique %>% 
+  mutate(est_preg_start = preg_end_final %m+% days(-40*7)) %>%
+  arrange(pat_id, est_preg_start) %>%
+  group_by(pat_id) %>%
+  mutate(preg_id = paste0(pat_id, "_", row_number())) %>%
+  ungroup() %>%
+  rename(preg_end_source = source_final) %>%
+  select(pat_id, preg_id, est_preg_start, preg_end_final, preg_end_source)
+    
+
+write.csv(df, 'Data/Derived/Poster Data/all_pregnancies_20240719.csv')
+```
+
+
