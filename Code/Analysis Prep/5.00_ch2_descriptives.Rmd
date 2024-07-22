@@ -22,7 +22,7 @@ library(lubridate)
 library(arsenal)
 ```
 
-Last updated on: `r `today()`.
+Last updated on: `r today()`.
 
 # Chapter Two
 
@@ -35,10 +35,12 @@ This is an R Markdown document which documents the following:
 ```{r load_data}
 uf_cohort <- read.csv('Data/Derived/uf_all_hints.csv')
 endo_cohort <- read.csv('Data/Derived/endo_all_hints.csv')
+updated_cases <- read.csv('Data/Derived/final_cohort_w_outcome.csv')
 false_negatives <- read.csv('Data/Derived/putative_false_negatives.csv')
 covars <- read.csv('Data/Derived/clean_covariates.csv')
 pat_cohort <- read.csv('Data/Derived/pat_cohort_w_censoring.csv')
 ttd_symptoms <- read.csv('Data/Derived/Chapter 2/pat_cohort_w_ttd.csv')
+ttd_symptoms_all_cases <- read.csv('Data/Derived/Chapter 2/pat_cohort_w_ttd_all_cases.csv')
 pat_symptom_status <- read.csv('Data/Derived/Chapter 2/pat_cohort_symptom_status.csv')
 address <- read.csv('Data/Derived/Chapter 1/pat_cohort_w_address.csv', 
                     colClasses = c(census_tract_final = "character",
@@ -52,17 +54,16 @@ pat_w_covars <- pat_cohort %>%
          hcu_fu, site_baseline, site_fu, insur_status, insur_status_filled, obgyn_care_cohort) %>%
   rename(index_provider_specialty = all_provider_specialty) %>%
   left_join(covars %>% select(pat_id, employ_simple_final, race_final, ethnicity_final, race_ethnic_final,
-                              HC_status, parity_binary, language_eng_sp, marital_status_final, bmi_baseline),
+                              HC_status, parity_binary, language_eng_sp, marital_status_final, bmi_baseline,
+                              contains('adeno')),
             by='pat_id')
 ```
 
 ```{r join_outcomes}
 pat_w_outcome <- ttd_symptoms %>%
-  select(pat_id, contains('uf'), contains('endo'), final_outcome_status, final_censor_date_outcome, 
-         final_censor_type_outcome, contains('symptom'), contains('ttd')) %>%
-  rename(final_censor_date = final_censor_date_outcome, 
-         final_censor_type = final_censor_type_outcome,
-         time_to_dx = ttd,
+  select(pat_id, contains('uf'), contains('endo'), final_outcome_status, final_censor_date, 
+         final_censor_type, contains('symptom'), contains('ttd')) %>%
+  rename(time_to_dx = ttd,
          time_to_dx_2symptoms = ttd_2)
 ```
 
@@ -84,44 +85,37 @@ confident_prevalents <- rbind(uf_cohort %>% filter(confident_prevalent) %>% sele
 not_in_nyc <- address %>% 
   filter(addr_NA_reason != 'Low accuracy score' & !is.na(addr_NA_reason)) %>%
   select(pat_id) %>%
-  left_join(pat_w_covars %>% 
-              filter(site_baseline == 'FLORIDA') %>%
-              select(pat_id), by='pat_id')
+  left_join(pat_w_covars %>% filter(site_baseline == 'FLORIDA') %>% select(pat_id), by='pat_id')
 
 ch2_cohort <- pat_w_outcome %>%
   # remove if not disease free at baseline
   filter(!pat_id %in% confident_prevalents$pat_id) %>%
   # remove if they do not live in NY-Newark CSA? %>%
-  inner_join(address %>% 
-               filter(is.na(addr_NA_reason) | addr_NA_reason == 'Low accuracy score') %>%
-               select(pat_id),
-             by='pat_id') %>%
+  filter(!pat_id %in% not_in_nyc$pat_id) %>%
+  # join covariates
   left_join(pat_w_covars, by='pat_id') %>%
-  filter(site_baseline != 'FLORIDA') %>%
-  mutate(included = case_when(!uf_confident_incident & 
-                                (!endo_confident_incident | is.na(endo_confident_incident))~'No',
-                              !endo_confident_incident & 
-                                (!uf_confident_incident | is.na(uf_confident_incident))~'No',
+  mutate(included = case_when(final_outcome_status == 'Unconfirmed' ~'No',
                               TRUE~'Yes'),
          two_symptom_cohort = !is.na(time_to_dx_2symptoms) & included=='Yes')
 ```
 
 ```{r ch2_cohort_Ns, eval=FALSE}
 # Eligible cohort
-ch2_cohort %>% distinct(pat_id) %>% nrow()
+print(paste0('Eligible patients: ', ch2_cohort %>% distinct(pat_id) %>% nrow()))
 # How many were excluded based on site/address
-not_in_nyc %>% distinct(pat_id) %>% nrow()
+print(paste0('Patients excluded based on site/address: ', not_in_nyc %>% distinct(pat_id) %>% nrow()))
 # Included 
-ch2_cohort %>% filter(included=='Yes') %>% nrow()
+print(paste0('Included patients: ', ch2_cohort %>% filter(included=='Yes') %>% nrow()))
 # Has complete exposure data
-ch2_cohort %>% filter(!is.na(race_ethnic_final) & !is.na(insur_status) & !is.na(language_eng_sp)) %>% nrow()
+print(paste0('Complete exposure data: ', ch2_cohort %>% filter(!is.na(race_ethnic_final) & !is.na(insur_status) & !is.na(language_eng_sp)) %>% nrow()))
 # Is excluded due predictor status
-ch2_cohort %>% filter(is.na(race_ethnic_final)) %>% nrow()
-ch2_cohort %>% filter(is.na(insur_status)) %>% nrow()
-ch2_cohort %>% filter(is.na(language_eng_sp)) %>% nrow()
+print(paste0('Missing race/ethnicity: ', ch2_cohort %>% filter(is.na(race_ethnic_final)) %>% nrow()))
+print(paste0('Missing insurance: ', ch2_cohort %>% filter(is.na(insur_status)) %>% nrow()))
+print(paste0('Missing language: ', ch2_cohort %>% filter(is.na(language_eng_sp)) %>% nrow()))
 # Symptom count
-ch2_cohort %>% filter(two_symptom_cohort) %>% nrow() # have at least two symptoms
-ch2_cohort %>% filter(!two_symptom_cohort & included=='Yes') %>% nrow() # excluded-only have one symptom
+print(paste0('Has >=two symptoms: ', ch2_cohort %>% filter(two_symptom_cohort) %>% nrow())) 
+print(paste0('Excluded for having only one symptom: ', ch2_cohort %>% filter(!two_symptom_cohort & included=='Yes') %>% 
+               nrow()))
 ```
 
 Chapter two eligibility includes:
@@ -146,13 +140,13 @@ DiagrammeR::grViz("digraph {
   graph [layout = dot, rankdir = TB]
   
   node [shape = rectangle]        
-  rec1 [label = 'Patients with symptom during follow-up (n=23,374)']
-  rec2 [label = 'Complete Outcome Data (n=23,052)']
-  rec3 [label = 'Final sample size (n=23,052)']
-  rec4 [label = 'Reports at least two symptoms (n=18,848)']
-  rec5 [label = 'Complete Exposure Data (n=18,747)']
-  rec6 [label = 'Missing race/ethnicity (n=2,189)']
-  rec7 [label = 'Missing insurance status (n=1,824)']
+  rec1 [label = 'Patients with symptom during follow-up (n=23,429)']
+  rec2 [label = 'Complete Outcome Data (n=22,959)']
+  rec3 [label = 'Final sample size (n=22,959)']
+  rec4 [label = 'Reports at least two symptoms (n=19,436)']
+  rec5 [label = 'Complete Exposure Data (n=19,436)']
+  rec6 [label = 'Missing race/ethnicity (n=2,132)']
+  rec7 [label = 'Missing insurance status (n=1,884)']
   rec8 [label = 'Missing preferred language (n=41)']
   rec9 [label = 'Excluded for lacking symptoms (n=49,249)']
   rec10 [label = 'Reported symptom prior to baseline (n=7,685)']
@@ -193,11 +187,11 @@ ch2_sample <- pat_cohort %>%
   left_join(ch2_cohort %>% select(pat_id, included, symptom_count, two_symptom_cohort), by='pat_id') %>%
   mutate(ch2_main = ifelse(included=='Yes', TRUE, FALSE),
          ch2_obgyn_cohort = ifelse(included=='Yes' & obgyn_care_cohort, TRUE, FALSE),
-         ch2_all_cases = ifelse(!pat_id %in% not_in_nyc$pat_id & symptom_count >= 1, TRUE, FALSE),
+         ch2_all_cases = ifelse(pat_id %in% ttd_symptoms_all_cases$pat_id & !pat_id %in% not_in_nyc$pat_id, TRUE, FALSE),
          ch2_two_symptoms = ifelse(two_symptom_cohort, TRUE, FALSE)) %>%
   select(pat_id, contains('ch2'))
 
-write.csv(ch2_final, 'Data/Derived/Chapter 2/sample_flags_20240529.csv', row.names = FALSE)
+write.csv(ch2_sample, 'Data/Derived/Chapter 2/sample_flags_20240529.csv', row.names = FALSE)
 ```
 
 ## Descriptive statistics {.tabset}
@@ -257,11 +251,13 @@ pat_labs <- list(hcu_baseline='Healthcare utilization (visits/baseline year)',
                  HC_status='Hormonal contraceptive use',
                  parity_binary='Parity status',
                  marital_status_final='Relationship status',
-                 bmi_baseline='Body mass index (kg/m^2)')
+                 bmi_baseline='Body mass index (kg/m^2)',
+                 adeno_fu = 'Adenomyosis dx during FU',
+                 adeno_baseline = 'Adenomyosis dx at baseline')
 
 # patient information
-summary(tableby(~hcu_baseline+age_20160801+HC_status+parity_binary+marital_status_final+bmi_baseline,
-                data=ch2_final), labelTranslations = pat_labs)
+summary(tableby(~hcu_baseline+age_20160801+HC_status+parity_binary+marital_status_final+bmi_baseline+
+                  adeno_fu + adeno_baseline,data=ch2_final), labelTranslations = pat_labs)
 ```
 
 ```{r table1_ses, results='asis'}
@@ -297,7 +293,7 @@ Summary of observations -- patients with longer time to diagonsis are/had:
 
 ```{r pred_ttd_pat, results='asis'}
 summary(tableby(time_to_dx_cat~hcu_baseline+age_20160801+HC_status+parity_binary+
-                  marital_status_final+bmi_baseline, data=ch2_final), 
+                  marital_status_final+bmi_baseline+adeno_fu + adeno_baseline, data=ch2_final), 
         labelTranslations = pat_labs)
 ```
 
@@ -407,13 +403,14 @@ Summary of observations -- patients who were LTFU are/had:
 - more likely to be a student
 - more likely to be NH White
 - more likely to be an English speaker
+- less likely to receive an Adeno dx during FU
 
 ```{r ltfu_covar_pat, results='asis'}
 ch2_final <- ch2_final %>% mutate(ltfu = case_when(final_censor_type == 'LTFU'~TRUE, 
                                                    TRUE~FALSE))
 # patient information
-summary(tableby(ltfu~hcu_baseline+age_20160801+HC_status+parity_binary+marital_status_final+bmi_baseline,
-                data=ch2_final), labelTranslations = pat_labs)
+summary(tableby(ltfu~hcu_baseline+age_20160801+HC_status+parity_binary+marital_status_final+bmi_baseline+
+                  adeno_fu + adeno_baseline,data=ch2_final), labelTranslations = pat_labs)
 ```
 
 ```{r ltfu_covar_ses, results='asis'}
@@ -444,10 +441,46 @@ Compared to the larger cohort, the OBGYN cohort is/has:
 ```{r obgyn_tab1, results='asis'}
 summary(tableby(obgyn_care_cohort~hcu_baseline+age_20160801+HC_status+parity_binary+
                   marital_status_final+bmi_baseline+site_baseline+insur_status+employ_simple_final+
-                  race_ethnic_final+language_eng_sp, data=ch2_final), 
+                  race_ethnic_final+language_eng_sp+adeno_fu + adeno_baseline, data=ch2_final), 
         labelTranslations = c(pat_labs, ses_labs))
 ```
 
+
+
+### Table 1 for all cases
+
+```{r}
+ch2_all_cases <- ttd_symptoms_all_cases %>%
+  select(pat_id, contains('uf'), contains('endo'), final_outcome_status_all, final_censor_date_all, 
+         final_censor_type_all, contains('symptom'), contains('ttd')) %>%
+  rename(time_to_dx = ttd,
+         time_to_dx_2symptoms = ttd_2) %>%
+  # remove if not disease free at baseline
+  filter(!pat_id %in% confident_prevalents$pat_id) %>%
+  # remove if they do not live in NY-Newark CSA? %>%
+  filter(!pat_id %in% not_in_nyc$pat_id) %>%
+  left_join(pat_w_covars, by='pat_id') %>%
+  mutate(symptom_group = case_when(grepl('R10.2|F52.6|N94.1|N94.0|M54.5', first_symptom_icd10s)~'Pain',
+                                  grepl('N94.[4-6]|N93.0|N93.8|N93.9|N92.0|N92.1|D50.0',
+                                             first_symptom_icd10s)~'Menstrual/Bleeding',
+                                  grepl('N83.0|N83.2|N73.9', first_symptom_icd10s)~'PID/Ovarian cysts',
+                                  grepl('N97.9', first_symptom_icd10s)~'Infertility',
+                                  grepl('N32.9|K59.00|N39.3|R19.7', first_symptom_icd10s)~
+                                    'Other Genito-urinary')) %>%
+  mutate(final_outcome_group = case_when(grepl('Both', final_outcome_status_all)~'Both',
+                                         TRUE~final_outcome_status_all))
+```
+
+
+There are no notable differences between the all cases cohort and the confident cases cohort. 
+
+```{r all_cases_tab1, results='asis'}
+# patient information
+summary(tableby(~hcu_baseline + age_20160801 + HC_status + parity_binary + 
+                  marital_status_final + bmi_baseline + site_baseline + insur_status + 
+                  employ_simple_final + race_ethnic_final + language_eng_sp + adeno_fu + adeno_baseline, 
+                data=ch2_all_cases), labelTranslations = c(pat_labs, ses_labs))
+```
 
 ### Table 1 for Patients with at least 2 symptoms
 
@@ -466,7 +499,7 @@ Compared to the larger cohort, the 2 symptom cohort is/has:
 ```{r 2symptom_tab1, results='asis'}
 summary(tableby(two_symptom_cohort~hcu_baseline+age_20160801+HC_status+parity_binary+
                   marital_status_final+bmi_baseline+site_baseline+insur_status+employ_simple_final+
-                  race_ethnic_final+language_eng_sp, data=ch2_final), 
+                  race_ethnic_final+language_eng_sp+adeno_fu + adeno_baseline, data=ch2_final), 
         labelTranslations = c(pat_labs, ses_labs))
 ```
 
@@ -517,15 +550,18 @@ Patients who are never diagnosed or are censored are/have:
 - lower total symptoms reported than cases
 - more likely to have infertility, PID, and ovarian cysts
 - much less likely than cases to have imaging/surgery
+- less likely to have an adenomyosis dx during FU
 
 ```{r no_dx_misc, results='asis'}
 ch2_final %>%
   left_join(ever_proc_info %>% select(pat_id, ever_imaging, ever_surgery), by='pat_id') %>%
-  tableby(never_dx~symptom_count+symptom_group+ever_imaging+ever_surgery, data=.) %>%
+  tableby(never_dx~symptom_count+symptom_group+ever_imaging+ever_surgery+adeno_fu+adeno_baseline, data=.) %>%
   summary(., labelTranslations = list(symptom_count = 'Symptom count',
                                    symptom_group = 'First symptom group',
                                    ever_imaging = 'Ever had related imaging',
-                                   ever_surgery = 'Ever had related surgery'))
+                                   ever_surgery = 'Ever had related surgery',
+                                   adeno_fu = 'Adenomyosis dx during FU',
+                                   adeno_baseline = 'Adenomyosis dx at baseline'))
 ```
 
 Among those who have at least two symptoms the differences shrink: 
@@ -534,11 +570,13 @@ Among those who have at least two symptoms the differences shrink:
 ch2_final %>%
   filter(two_symptom_cohort) %>%
   left_join(ever_proc_info %>% select(pat_id, ever_imaging, ever_surgery), by='pat_id') %>%
-  tableby(never_dx~symptom_count+symptom_group+ever_imaging+ever_surgery, data=.) %>%
+  tableby(never_dx~symptom_count+symptom_group+ever_imaging+ever_surgery+adeno_fu+adeno_baseline, data=.) %>%
   summary(., labelTranslations = list(symptom_count = 'Symptom count',
                                    symptom_group = 'First symptom group',
                                    ever_imaging = 'Ever had related imaging',
-                                   ever_surgery = 'Ever had related surgery'))
+                                   ever_surgery = 'Ever had related surgery',
+                                   adeno_fu = 'Adenomyosis dx during FU',
+                                   adeno_baseline = 'Adenomyosis dx at baseline'))
 ```
 
 #### Date of first symptom
@@ -599,7 +637,8 @@ ch2_final %>%
                                                                           'Presumed True Negative', 'Case'))) %>%
   tableby(false_negative_status~hcu_baseline + age_20160801 + HC_status + parity_binary + 
                   marital_status_final + bmi_baseline + site_baseline + insur_status + 
-                  employ_simple_final + race_ethnic_final + language_eng_sp, data=.) %>%
+                  employ_simple_final + race_ethnic_final + language_eng_sp + adeno_fu + adeno_baseline, 
+          data=.) %>%
   summary(., labelTranslations = c(pat_labs, ses_labs))
 ```
 
@@ -615,6 +654,7 @@ Summary of findings, patients with symptoms have:
 - slightly higher unemployment
 - much more likely to be Hispanic, less likely to be NH White
 - higher proportion are Spanish-speakers
+- more likely to have adeno at baseline and during FU
 
 ```{r pat_symptoms, results='asis'}
 pat_w_covars %>% 
@@ -622,7 +662,8 @@ pat_w_covars %>%
   mutate(has_symptoms = case_when(first_symptom~'Has symptoms', TRUE~'No symptoms')) %>%
   tableby(has_symptoms~hcu_baseline + age_20160801 + HC_status + parity_binary + 
                   marital_status_final + bmi_baseline + site_baseline + insur_status + 
-                  employ_simple_final + race_ethnic_final + language_eng_sp, data=.) %>%
+                  employ_simple_final + race_ethnic_final + language_eng_sp + adeno_fu + adeno_baseline,
+          data=.) %>%
   summary(., labelTranslations = c(pat_labs, ses_labs))
 ```
 
@@ -643,14 +684,16 @@ Summary of differences, cases with symptoms were/had:
 - more likely to be unemployed
 - more likely to be Hispanic, less likely to be NH White
 - more likely to speak Spanish
+- slightly more likely to have adeno dx during FU
 
 ```{r uf_case_symptoms, results='asis'}
 pat_w_covars %>% 
-  filter(pat_id %in% uf_cohort$pat_id[which(uf_cohort$confident_incident)]) %>%
+  filter(pat_id %in% updated_cases$pat_id[which(updated_cases$uf_confident_incident)]) %>%
   mutate(has_symptoms = ifelse(pat_id %in% ch2_final$pat_id, TRUE, FALSE)) %>%
   tableby(has_symptoms~hcu_baseline + age_20160801 + HC_status + parity_binary + 
                   marital_status_final + bmi_baseline + site_baseline + insur_status + 
-                  employ_simple_final + race_ethnic_final + language_eng_sp, data=.) %>%
+                  employ_simple_final + race_ethnic_final + language_eng_sp + adeno_fu + adeno_baseline, 
+          data=.) %>%
   summary(., labelTranslations = c(pat_labs, ses_labs))
 ```
 
@@ -667,14 +710,16 @@ Summary of differences, cases with symptoms were/had:
 - more likely to be unemployed
 - more likely to be Hispanic, less likely to be NH White
 - more likely to speak Spanish
+- more likely to have adeno dx during FU
 
 ```{r endo_case_symptoms, results='asis'}
 pat_w_covars %>% 
-  filter(pat_id %in% endo_cohort$pat_id[which(endo_cohort$confident_incident)]) %>%
+  filter(pat_id %in% updated_cases$pat_id[which(updated_cases$endo_confident_incident)]) %>%
   mutate(has_symptoms = ifelse(pat_id %in% ch2_final$pat_id, TRUE, FALSE)) %>%
   tableby(has_symptoms~hcu_baseline + age_20160801 + HC_status + parity_binary + 
                   marital_status_final + bmi_baseline + site_baseline + insur_status + 
-                  employ_simple_final + race_ethnic_final + language_eng_sp, data=.) %>%
+                  employ_simple_final + race_ethnic_final + language_eng_sp + adeno_fu + adeno_baseline,
+          data=.) %>%
   summary(., labelTranslations = c(pat_labs, ses_labs))
 ```
 

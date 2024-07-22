@@ -19,12 +19,18 @@ library(dplyr)
 library(lubridate)
 library(arsenal)
 library(mice)
+library(ggmice)
+library(tableone)
+library(ggpubr)
+library(naniar)
 ```
 
 Last updated on: `r today()`.
 
 ```{r load}
-df_all <- read.csv('Data/Derived/all_data_noImpute_20240613.csv')
+df_all <- read.csv('Data/Derived/all_data_noImpute_20240626.csv')
+race_ethnic <- read.csv('Data/Derived/clean_race_ethnicity_dummy.csv')
+tract_race <- read.csv('Data/External/ACS_CT_race_2016.csv')
 ```
 
 This is the final curation step before analysis. The following must be accomplished: 
@@ -34,37 +40,61 @@ This is the final curation step before analysis. The following must be accomplis
 - Check that imputation values are logical
 - Write out imputed datasets for analysis
 
-## Prep data for imputation
+## Prep data for imputation {.tabset}
 
 Goals here are to get all cells above n=500, maintaining granularity as much as possible.
 
 Reminder: for variables we are imputing, we want to make sure all categories are appropriate for analysis and informative to our causal structure. For variables, we are using to inform the predictive matrix for imputation, we want to make sure the categories are logical and informative for the missingness structure. 
 
+### Site
+
+Looks fine will keep as is. 
+
 ```{r site}
 # look at data as is
 CreateTableOne(data = df_all, var=c('site_baseline'), includeNA = TRUE)
 ```
-QUESTION: Do we need to roll up telemedicine (n=43)? These encounters have no location but I can assign them Manhattan OP? or NA?
+QUESTION: Do we need to roll up telemedicine (n=43)? These encounters have no location but I can assign them Manhattan OP? or NA? Or choose second most common?
+
+Other option: Look at second most common site for NYU Langone BK patients as well as insurance type to see if they might logically roll-up into Brooklyn OP or FHC.
+
+### Employment
+
+Looks fine will keep as is. 
 
 ```{r employment}
 # look at data as is
 CreateTableOne(data = df_all, var=c('employ_simple_final'), includeNA = TRUE)
 ```
-QUESTION: What would be a logical roll-up for retired?
+### Race and ethnicity
 
-```{r race_ethnic}
+Will impute race and ethnicity separately and then combine.
+
+```{r}
 # look at data as is
 CreateTableOne(data = df_all, var=c('race_final', 'ethnicity_final', 'race_ethnic_final'), includeNA = TRUE)
+```
 
-# roll native hawaiian and pacific islander together -- make unmapped NA
-df_all <- df_all %>% 
-  mutate(race_final_new = case_when(race_final %in% c('Native Hawaiian', 'Pacific Islander')~'Native Hawaiian/Pacific Islander',
-                                    TRUE~race_final))
+```{r multiple}
+# look at data for multi racial individual
+CreateTableOne(data = race_ethnic %>% filter(multiple_races>1 & pat_id %in% df_all$pat_id), 
+               var=names(race_ethnic)[-1], includeNA = TRUE)
+```
+We will also use a geocoding approach to imputing race/ethnicity based on address data. For all patients with a high quality address, we link the CT proportion for each racial category available in the ACS 2016 5-yr estimates. 
+
+Ideally, we would also use surnames but that is not possible for our dataset, however it is good that we have preferred language. [Xue et al. 2019](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6606547/), [Silva et al. 2019](https://link.springer.com/article/10.1007/s10742-019-00200-9).
+
+```{r}
+# ACS summary table
+tract_race_df <- df_all %>% select(pat_id, GEOID) %>% left_join(tract_race, by='GEOID')
 
 # look at data as is
-CreateTableOne(data = df_all, var=c('race_final_new', 'ethnicity_final'), includeNA = TRUE)
+CreateTableOne(data = tract_race_df, var=names(tract_race_df)[-c(1,2)])
 ```
-QUESTION: Is that rolled up enough? Alternatively, I could combine make the roll-up Asian/PI and add NH to AI/AN and make the category Native.
+
+### Symptoms
+
+Looks fine will keep as is. 
 
 ```{r symptoms}
 # make symptom group variable
@@ -75,75 +105,343 @@ df_all<- df_all %>%
                                    grepl('N83.0|N83.2', first_symptom_icd10s)~'Ovarian cysts',
                                    grepl('N73.9', first_symptom_icd10s)~'PID',
                                    grepl('N97.9', first_symptom_icd10s)~'Infertility',
-                                   grepl('N32.9|K59.00|N39.3|R19.7', first_symptom_icd10s)~'Genito-urinary'))
+                                   grepl('N32.9|K59.00|N39.3|R19.7', first_symptom_icd10s)~'Genito-urinary',
+                                   TRUE~'No symptoms'))
 # look at data as is
-CreateTableOne(data = df_all, var='first_symptom_group', includeNA = TRUE)
+CreateTableOne(data = df_all, var='first_symptom_group')
 # no roll up needed
 ```
-QUESTION: Originally, I put PID & Ovarian cysts together since they are both common mis-diagnoses or intermediary diagnosis for Endo and to a lesser extent, UF. However, they are somewhat different with regards to symptom profiles (although overlapping). The main distinction is that PID shares some urinary symptoms and therefore, might also go well with genito-urinary symptoms. Should I move it there? Keep is separate even though n is small?
+QUESTION: Originally, I put PID & Ovarian cysts together since they are both common mis-diagnoses or intermediary diagnosis for Endo and to a lesser extent, UF. However, they are somewhat different with regards to symptom profiles (although overlapping). The main distinction is that PID shares some urinary symptoms and therefore, might also go well with genito-urinary symptoms. Should I move it there? Keep is separate even though n is small? *Move PID to genitourinary if imputation is unstable*
+
+### Index encounter
+
+We will split the data on the encounter type into provider department and provider type. 
+
+For some encounters, only the provider type is mentioned in specialty (i.e. nurse) and no other speciality is mentioned then their care was general.
+
+Department and provider type will be a dummy variable as patients may see several departments/provider types in one day, but when collapsed it is collapsed by proximity to a provider with relevant training to UF/Endo: 
+
+- OBGYN > Endocrine > General > Emergency. Swap general and endocrine?
+- MD > NP > RN > PA
 
 ```{r provider_specialty}
-## need to separate provider specialties
+# encounter department (assume every one which is just a provider type is general)
 general_care <- c('ACUTE CARE NURSE PRACTITIONER','ADULT HEALTH NURSE PRACTITIONER','GENERAL PRACTICE'
                   ,'MEDICINE, ADULT','MEDICINE, FAMILY MEDICINE','MEDICINE, INTERNAL MEDICINE','NURSE PRACTITIONER'
-                  , "FAMILY NURSE PRACTITIONER", "PEDIATRIC NURSE PRACTITIONER", "PEDIATRICS, ADOLESCENT MEDICINE", "PEDIATRICS, GENERAL"
-                  , "PHYSICIAN ASSISTANT", "PHYSICIAN ASSISTANT, MEDICAL", "REGISTERED NURSE")
-obgyn_care <- c('OBSTETRICS & GYNECOLOGY','OBSTETRICS & GYNECOLOGY NURSE PRACTITIONER','OBSTETRICS GYNECOLOGY, GENERAL', "WOMEN'S HEALTH NURSE PRACTITIONER")
-gyn_care <- c('GYNECOLOGY, GENERAL','GYNECOLOGY, REPRODUCTIVE ENDOCRINOLOGY','GYNECOLOGY, URO-GYNECOLOGY','UROLOGY, URO-GYNECOLOGY', "GYNECOLOGY, GYNECOLOGIC ONCOLOGY")
-endocrine_care <- c('MEDICINE, ENDOCRINOLOGY','MEDICINE, ENDOCRINOLOGY, DIABETES, OBESITY, METABOLISM',  "PEDIATRIC ENDOCRINOLOGY")
+                  , "FAMILY NURSE PRACTITIONER", "PEDIATRIC NURSE PRACTITIONER", "PEDIATRICS, ADOLESCENT MEDICINE", 
+                  "PEDIATRICS, GENERAL", "PHYSICIAN ASSISTANT", "PHYSICIAN ASSISTANT, MEDICAL", "REGISTERED NURSE")
+obgyn_care <- c('OBSTETRICS & GYNECOLOGY','OBSTETRICS GYNECOLOGY, GENERAL', "WOMEN'S HEALTH")
+gyn_care <- c('GYNECOLOGY, GENERAL','GYNECOLOGY, REPRODUCTIVE ENDOCRINOLOGY','URO-GYNECOLOGY','URO-GYNECOLOGY', "GYNECOLOGIC ONCOLOGY")
+endocrine_care <- c('MEDICINE, ENDOCRINOLOGY', "PEDIATRIC ENDOCRINOLOGY")
 ob_care <- c('OBSTETRICS, GENERAL','OBSTETRICS, MATERNAL FETAL MEDICINE')
-ed_care <- c("EMERGENCY MEDICINE, ADULT", "EMERGENCY MEDICINE, GENERAL", "EMERGENCY MEDICINE, PEDIATRICS", "URGENT CARE")
+ed_care <- c("EMERGENCY MEDICINE", "URGENT CARE")
+# provider type
+nurse_prac <- 'NURSE PRACTITIONER'
+phys_assist <- 'PHYSICIAN ASSISTANT'
+nurse <- 'REGISTERED NURSE'
 
 # make unique variables for each major provider grouping
 prov_specialty <- df_all %>%
   group_by(pat_id) %>%
-  mutate(index_enc_OBGYN = (grepl(paste(c(obgyn_care, gyn_care, ob_care),collapse="|"),toupper(index_provider_specialty))),
-         index_enc_general = (grepl(paste(general_care,collapse="|"),toupper(index_provider_specialty))),
-         index_enc_endocrine = (grepl(paste(endocrine_care,collapse="|"),toupper(index_provider_specialty))),
-         index_enc_emergency = (grepl(paste(ed_care,collapse="|"),toupper(index_provider_specialty)))) %>%
+  mutate(index_provider_specialty = toupper(index_provider_specialty)) %>%
+  mutate(index_enc_OB = (grepl(paste(ob_care,collapse="|"), index_provider_specialty)),
+         index_enc_GYN = (grepl(paste(gyn_care,collapse="|"), index_provider_specialty)),
+         index_enc_OBGYN = (grepl(paste(obgyn_care,collapse="|"), index_provider_specialty)),
+         index_enc_general = (grepl(paste(general_care,collapse="|"), index_provider_specialty)),
+         index_enc_endocrine = (grepl(paste(endocrine_care,collapse="|"), index_provider_specialty)),
+         index_enc_emergency = (grepl(paste(ed_care,collapse="|"), index_provider_specialty)),
+         index_enc_NP = grepl(nurse_prac, index_provider_specialty),
+         index_enc_PA = grepl(phys_assist, index_provider_specialty),
+         index_enc_RN = grepl(nurse, index_provider_specialty),
+         index_enc_MD = !grepl(paste(c(nurse_prac, phys_assist, nurse), collapse="|"), index_provider_specialty)) %>%
   select(pat_id, index_provider_specialty, contains('index_enc')) %>%
-  mutate(count_unique_prov = sum(index_enc_OBGYN, index_enc_general, index_enc_endocrine, index_enc_emergency, na.rm = TRUE)) %>%
+  mutate(count_unique_dept = sum(index_enc_OBGYN, index_enc_general, index_enc_endocrine, index_enc_emergency, na.rm = TRUE),
+         count_unique_prov = sum(index_enc_NP, index_enc_PA, index_enc_RN, index_enc_MD, na.rm = TRUE)) %>%
   ungroup() %>%
-  mutate(index_enc_prov_final = case_when(index_enc_OBGYN~'OBGYN', 
-                                          index_enc_emergency~'Emergency', 
-                                          index_enc_endocrine~'Endocrine', 
-                                          index_enc_general~'General'))
-
-#length(which(prov_specialty$count_unique_prov > 1))
-# only 1055 with more than one
-#table(prov_specialty$index_provider_specialty[which(prov_specialty$count_unique_prov>1)])
-
-# look at rolled-up data
-CreateTableOne(data = prov_specialty, var='index_enc_prov_final', includeNA = TRUE)
-# no roll up needed
+  mutate(index_enc_dep_final = case_when(index_enc_OBGYN | index_enc_OB | index_enc_GYN~'OBGYN', 
+                                          index_enc_emergency~'Endocrine', 
+                                          index_enc_endocrine~'General', 
+                                          index_enc_general~'Emergency'),
+         index_enc_prov_type = case_when(index_enc_MD~'Physician',
+                                         index_enc_NP~'Nurse practitioner',
+                                         index_enc_RN~'Registered Nurse',
+                                         index_enc_PA~'Physician assistant'))
 ```
-QUESTION: I chose to prioritize the index provider specialty (if we have to keep one) as OBGYN > Emergency > Endocrine > General. This means that if a patient sees providers of any two or more of these specialties the one that gets recorded for their index encounter goes in that order. I chose OBGYN first since thats most informative to them seeing a relevant provider, Emergency second since that suggests they sought emergency care (not regular care), then Endocrine for some sort of non-OBGYN specialty care, and finally general the least specialized to detect UF/Endo. The prioritization is basically organized on two axes: proximity to relevant care (ability to dx the conditions) and care seeking information (ED > general). Does this make sense? 
 
-Perhaps it should just be on relevance to diagnosis, OBGYN > Endocrine > General > Emergency. Swap general and endocrine?
+```{r, eval=FALSE, include=FALSE}
+## Department type
+length(which(prov_specialty$count_unique_dept > 1))
+# only 698 with more than one
+table(prov_specialty$index_provider_specialty[which(prov_specialty$count_unique_dept>1)])
+
+## Provider type
+length(which(prov_specialty$count_unique_prov > 1))
+# only 5 with more than one
+table(prov_specialty$index_provider_specialty[which(prov_specialty$count_unique_prov>1)])
+```
+
+```{r}
+# look at dummy & rolled-up data
+CreateTableOne(data = prov_specialty, var=names(prov_specialty)[-c(1:3,14,15)], includeNA = TRUE)
+```
+
+### Hazards of UF and Endo
+
+Here I calculate the nelson aalen hazards of UF and Endo to include in the imputation predictor matrix.
 
 ```{r hazard_vars}
-nelsonaalen(data, timevar, statusvar)
+df_all$uf_hazards <- nelsonaalen(df_all, uf_person_years, uf_binary)
+df_all$endo_hazards <- nelsonaalen(df_all, endo_person_years, endo_binary)
 ```
 
-# code from bonneville https://github.com/survival-lumc/CauseSpecCovarMI
-
-## Look at missingness prior to imputation
+### {.unnumbered}
 
 ## Prep imputation
 
+Refer to the [blog](https://bookdown.org/mwheymans/bookmi/multiple-imputation.html#setting-the-imputation-methods) for performing imputation in R.
+
+*code from bonneville:* https://github.com/survival-lumc/CauseSpecCovarMI
+
 Prep needed for imputation: 
-1. Select variables to include in predcitor Matrix
-2. Specify predictor matrix
-3. Specify imputation methods for each variable
+
+### 1. Select variables to include in predictor matrix
+
+Note: I used the filled insurance variables which takes the closest encounter with non-missing insurance status, but this did not fill in that many missing insurance statuses in general. I can use the non-filled version though if preferred. 
+
+```{r}
+vars <- c('pat_id', 'uf_hazards', 'endo_hazards', 'site_baseline', 'age_20160801', 'hcu_baseline',
+          'insur_status_filled', 'employ_simple_final', 'parity_binary', 'language_eng_sp', 'HC_status',
+          'marital_status_final', 'bmi_baseline', 'ICE_RI', 'symptom_count', 'first_symptom_group',
+          'race_final', 'ethnicity_final', 'uf_binary', 'endo_binary')
+
+df_miss <- df_all %>% 
+  select(all_of(vars)) %>%
+  mutate(symptom_count = ifelse(is.na(symptom_count), 0, symptom_count)) %>%
+  #left_join(race_ethnic %>% mutate(multiple_races = ifelse(multiple_races>1, TRUE, FALSE)), by='pat_id') %>%
+  left_join(tract_race_df %>% select(-GEOID), by='pat_id') %>%
+  left_join(prov_specialty %>% 
+              select(-index_enc_date, -index_provider_specialty, -index_enc_dep_final, 
+                     -index_enc_prov_type, -count_unique_dept, -count_unique_prov), by='pat_id')
+```
+
+### 2. Look at missingness in variables
+
+The proportion of the data that are complete cases are `r prop_complete_case(df_miss)`. 
+
+```{r}
+## explore missingness patterns in the data
+plot_pattern(df_miss %>% select(-pat_id), square = FALSE, rotate = TRUE)
+```
+
+Outflux is an indicator of the potential usefulness of Yj for imputing other variables. Outflux depends on the proportion of missing data of the variable. Outflux of a completely observed variable is equal to 1, whereas outflux of a completely missing variable is equal to 0. For two variables having the same proportion of missing data, the variable with higher outflux is better connected to the missing data, and thus potentially more useful for imputing other variables.
+
+Influx depends on the proportion of missing data of the variable. Influx of a completely observed variable is equal to 0, whereas for completely missing variables we have influx = 1. For two variables with the same proportion of missing data, the variable with higher influx is better connected to the observed data, and might thus be easier to impute. [package](https://search.r-project.org/CRAN/refmans/mice/html/flux.html)
+
+```{r}
+plot_flux(df_miss %>% select(-pat_id))
+```
+
+```{r}
+plot_corr(df_miss %>% select(-pat_id), square = FALSE, rotate = TRUE)
+```
+
+```{r test_mice}
+#df_miss_sample <- df_miss[sample(nrow(df_miss), size=5000),]
+df_miss_sample <- df_miss
+# factor categorical variables
+df_miss_sample <- df_miss_sample %>%
+  mutate(across(is_logical, ~factor(.))) %>%
+  mutate(insur_status_filled = factor(insur_status_filled),
+         employ_simple_final = factor(employ_simple_final),
+         marital_status_final = factor(marital_status_final),
+         parity_binary = factor(parity_binary),
+         language_eng_sp = factor(language_eng_sp),
+         race_final = factor(race_final),
+         ethnicity_final = factor(ethnicity_final))
+```
+
+### 3. Specify predictor matrix
+
+```{r}
+## remove the study_id from the imputation predictor matrix
+pred <- quickpred(df_miss_sample, exclude = "pat_id")
+
+# force prediction matrix to use CT for missing race
+pred[which(rownames(pred)=='race_final'),which(grepl('CT',rownames(pred)))] <- 1
+pred[which(rownames(pred)=='ethnicity_final'),which(grepl('CT',rownames(pred)))] <- 1
+pred[which(grepl('CT',rownames(pred))),which(rownames(pred)=='ethnicity_final')] <- 1
+pred[which(grepl('CT',rownames(pred))),which(rownames(pred)=='race_final')] <- 1
+
+# create predictor matrix plot
+plot_pred(pred, square = FALSE, rotate=TRUE)
+```
+
+### 4. Specify imputation methods for each variable
+
+```{r}
+## set empty imputation
+ini <- mice(df_miss_sample, max=0, print=FALSE)
+
+## set method for covariates & chemicals to be substituted to ""
+meth <- ini$method
+meth
+```
 
 ## Imputation
 
-```{r test_mice}
-sample(data, 1000)
+Notes: 
+
+- Impute for all missingness in the data (including variables we won’t include)
+- Shoot for 20 imputed datasets according to [Bodner et al.](https://www.tandfonline.com/doi/full/10.1080/10705510802339072) and [White et al.](https://onlinelibrary.wiley.com/doi/full/10.1002/sim.4067) recommendations
+- Test on 5% subset (~5000 patients) and see how long it takes
+
+```{r}
+start.time <- Sys.time()
+## impute for missing covariates
+imp_df <- mice(df_miss_sample, method = meth, pred = pred, m=20, seed=1234, print =FALSE)
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+time.taken
+```
+
+```{r}
+print(paste0('Based on this run, the full dataset should take ',
+             round(as.numeric(time.taken)*(dim(df_all)[1]/dim(df_miss_sample)[1])/60, 3), ' hours.'))
+```
+
+The number of missing variable that were imputed:
+
+```{r}
+imp_df$nmis
 ```
 
 ## Check imputation
 
+### Convergence
+
+The convergence can be visualized by plotting the means in a convergence plot. In this plot you want to see that the variance between the imputation chains is almost equal to the variance within the chains, which indicates healthy convergence.
+
+```{r}
+plot(imp_df)
+```
+
+Convergence appears relatively healthy for most variables, with the exception of potentially race_MENA.
+
+### Distributions
+
+```{r}
+## check distribution of all imputed covariates
+c1 <- ggmice(imp_df, ggplot2::aes(x = .imp, y = insur_status_filled)) + ggplot2::geom_boxplot()
+c2 <- ggmice(imp_df, ggplot2::aes(x = .imp, y = employ_simple_final)) + ggplot2::geom_jitter()
+c3 <- ggmice(imp_df, ggplot2::aes(x = .imp, y = parity_binary)) + ggplot2::geom_jitter()
+c4 <- ggmice(imp_df, ggplot2::aes(x = .imp, y = language_eng_sp)) + ggplot2::geom_jitter()
+c5 <- ggmice(imp_df, ggplot2::aes(x = .imp, y = marital_status_final)) + ggplot2::geom_jitter()
+c6 <- ggmice(imp_df, ggplot2::aes(x = .imp, y = bmi_baseline)) + ggplot2::geom_jitter()
+c7 <- ggmice(imp_df, ggplot2::aes(x = .imp, y = ICE_RI)) + ggplot2::geom_jitter()
+ggarrange(c1,c2,c3,c4,c5,c6,c7, ncol=3, nrow=3, common.legend = TRUE)
+```
+```{r}
+# check continous variables for logical ranges
+print(paste('The full range of imputed ICE-RI is ', 
+            round(min(imp_df$imp$ICE_RI),3), ' to ', round(max(imp_df$imp$ICE_RI), 3)))
+
+print(paste('The full range of imputed BMI is ', 
+            round(min(imp_df$imp$bmi_baseline),3), ' to ', round(max(imp_df$imp$bmi_baseline), 3)))
+```
+
+### Race and ethnicity
+
+```{r}
+# race variables
+c8 <- ggmice(imp_df, ggplot2::aes(x = .imp, y = race_final)) + ggplot2::geom_jitter()
+c9 <- ggmice(imp_df, ggplot2::aes(x = .imp, y = ethnicity_final)) + ggplot2::geom_jitter()
+ggarrange(c8,c9, ncol=2, nrow=1, common.legend = TRUE)
+```
+
+```{r, eval=FALSE, include=FALSE}
+# race variables
+c8 <- ggmice(imp_df, ggplot2::aes(x = .imp, y = race_White)) + ggplot2::geom_jitter()
+c9 <- ggmice(imp_df, ggplot2::aes(x = .imp, y = race_Black)) + ggplot2::geom_jitter()
+c10 <- ggmice(imp_df, ggplot2::aes(x = .imp, y = race_Asian)) + ggplot2::geom_jitter()
+c11 <- ggmice(imp_df, ggplot2::aes(x = .imp, y = race_native)) + ggplot2::geom_jitter()
+c12 <- ggmice(imp_df, ggplot2::aes(x = .imp, y = race_NHPI)) + ggplot2::geom_jitter()
+c13 <- ggmice(imp_df, ggplot2::aes(x = .imp, y = race_MENA)) + ggplot2::geom_jitter()
+c14 <- ggmice(imp_df, ggplot2::aes(x = .imp, y = Hispanic)) + ggplot2::geom_jitter()
+ggarrange(c8,c9,c10,c11,c12,c13,c14, ncol=3, nrow=3, common.legend = TRUE)
+```
+
+```{r, eval=FALSE, include=FALSE}
+## create race_ethnic variable for each imputed dataset
+imp_long <- complete(imp_df, action='long', include=FALSE)
+
+## get multiple races value
+race_imputed <- imp_long %>%
+  select(.imp, pat_id, contains('race_'), Hispanic) %>%
+  mutate_if(is.factor, ~as.logical(.)) %>%
+  rowwise() %>% 
+  mutate(multiple_races = sum(race_White,race_Black,race_Asian,race_native,race_NHPI,race_MENA)) %>%
+  ungroup()
+
+## get one race_final value for those who do not have multiple races
+r2 <- race_imputed %>% 
+  filter(multiple_races == 1) %>%
+  select(-multiple_races, -Hispanic, -contains('CT_race')) %>%
+  pivot_longer(cols=contains('race_'), names_to='race', names_prefix = 'race_', values_to = 'value') %>%
+  filter(value) %>% 
+  mutate(race_final = race) %>%
+  select(.imp, pat_id, race_final)
+
+## for each dataset determine their combined race_ethnic variables
+race_ethnic_imputed <- race_imputed %>%
+  left_join(r2, by=c('.imp', 'pat_id')) %>%
+  mutate(race_ethnic_imp = case_when(Hispanic ~ 'Hispanic/Latino',
+                                     multiple_races > 1 ~ 'NH Multiple Races',
+                                     TRUE~str_c('NH ', race_final)),
+         race_final = case_when(is.na(race_final) & multiple_races > 2~'Multiple races',
+                                is.na(race_final) & multiple_races == 0~'Unmapped',
+                                TRUE~race_final))
+
+# join back to imputed data and convert back to mids
+imp_long2 <- imp_long %>%
+  left_join(race_ethnic_imputed %>% select(.imp, pat_id, race_final, race_ethnic_imp), 
+            by=c('.imp', 'pat_id'))
+```
+
+```{r}
+## create race_ethnic variable for each imputed dataset
+imp_long <- complete(imp_df, action='long', include=FALSE)
+
+## for each dataset determine their combined race_ethnic variables
+imp_long2 <- imp_long %>%
+  mutate(race_ethnic_final = case_when(ethnicity_final == 'Hispanic/Latino'~'Hispanic/Latino',
+                                       TRUE~str_c('NH ', race_final)))
+```
+
+```{r}
+# what percent of imputed patients are multiple race
+print(paste0('Proportion of patients missing race have multiple races. imputed as TRUE: ', round(length(which(imp_long$race_final == 'Multiple Races'))/dim(imp_long)[1], 3)))
+
+print(paste0('Proportion of full dataset (non-missing) that are multiple races: ',
+round(length(which(df_miss$race_final == 'Multiple Races'))/length(which(!is.na(df_miss$race_final))), 3)))
+```
+
+```{r}
+OG_df <- complete(imp_df, action='long', include = TRUE) %>% 
+  filter(.imp==0) %>%
+  left_join(df_all %>% select(pat_id, race_ethnic_final), by = 'pat_id')
+
+imp_df2 <- as.mids(rbind(OG_df, imp_long2))
+
+# make sure none are missing
+#imp_long2 %>% filter(is.na(race_ethnic_final)) %>% nrow()
+```
+
+```{r}
+ggmice(imp_df2, ggplot2::aes(x = .imp, y = race_ethnic_final)) + ggplot2::geom_jitter()
+```
+
 ## Write out imputed data sets
 
-Subset for each chapter
+```{r}
+save(imp_df2, file='Data/Derived/all_data_imputed_20240718.Rdata')
+```

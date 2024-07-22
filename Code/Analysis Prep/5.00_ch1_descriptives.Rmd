@@ -43,6 +43,7 @@ This is an R Markdown document which documents the following:
 ```{r load_data}
 uf_cohort <- read.csv('Data/Derived/uf_all_hints.csv')
 endo_cohort <- read.csv('Data/Derived/endo_all_hints.csv')
+pat_w_outcome <- read.csv('Data/Derived/final_cohort_w_outcome.csv')
 false_negatives <- read.csv('Data/Derived/putative_false_negatives.csv')
 covars <- read.csv('Data/Derived/clean_covariates.csv')
 pat_cohort <- read.csv('Data/Derived/pat_cohort_w_censoring.csv')
@@ -66,8 +67,8 @@ pat_w_covars <- pat_cohort %>%
             by='pat_id')
 ```
 
-```{r join_outcomes}
-pat_w_outcome <- pat_cohort %>%
+```{r join_outcomes, eval=FALSE}
+pat_w_outcome2 <- pat_cohort %>%
   select(pat_id) %>%
   left_join(uf_cohort %>% select(pat_id, confident_incident, first_dx_date, first_confirm_date, 
                                  first_confirm_type, first_confirm_name, first_location_date) %>%
@@ -130,6 +131,12 @@ gent_index_sub <- gent_index %>% select(tractid, nta_name, score_0.5) %>%
   rename(gent_index = score_0.5, NTAName = nta_name) %>%
   select(-tractid)
 
+# exclude those who do not live in NYC or site_baseline == 'Florida'
+not_in_nyc <- address %>% 
+  filter(addr_NA_reason != 'Low accuracy score' & !is.na(addr_NA_reason)) %>%
+  select(pat_id) %>%
+  left_join(pat_w_covars %>% filter(site_baseline == 'FLORIDA') %>% select(pat_id), by='pat_id')
+
 # join to the address data
 pat_w_exposure <- address %>%
   select(-final_censor_date, -final_censor_type) %>%
@@ -166,10 +173,7 @@ ch1_cohort <- pat_w_outcome %>%
   left_join(pat_w_covars %>% select(pat_id, site_baseline), by='pat_id') %>%
   # remove those who live outside NYC or have Florida for baseline site
   filter(addr_NA_reason != 'Outside of NY-Newark CSA' | site_baseline != 'FLORIDA') %>%
-  mutate(included = case_when(!uf_confident_incident & 
-                                (!endo_confident_incident | is.na(endo_confident_incident))~'No',
-                              !endo_confident_incident & 
-                                (!uf_confident_incident | is.na(uf_confident_incident))~'No',
+  mutate(included = case_when(final_outcome_status == 'Unconfirmed' ~'No',
                               !is.na(addr_NA_reason)~'No', 
                               TRUE~'Yes'))
 ```
@@ -188,22 +192,23 @@ Reasons for exclusion from eligible cohort:
 
 ```{r ch1_cohort_Ns, eval=FALSE}
 # Eligible cohort
-ch1_cohort %>% distinct(pat_id) %>% nrow()
-# Outcome could not be ascertained
-ch1_cohort %>% 
-  # keep only confident cases or controls (not those with hesitant positives)
-  filter(uf_dx | endo_dx | (is.na(uf_confident_incident) & is.na(endo_confident_incident))) %>% 
-  distinct(pat_id) %>% nrow()
+print(paste0('Eligible patients: ', ch1_cohort %>% distinct(pat_id) %>% nrow()))
+# Has outcome status
+print(paste0('Has outcome data: ', ch1_cohort %>% filter(final_outcome_status != 'Unconfirmed') %>% distinct(pat_id) %>% nrow()))
 # Has exposure data
-ch1_cohort %>% 
+print(paste0('Also has exposure data: ',ch1_cohort %>% 
   # keep only confident cases or controls (not those with hesitant positives)
-  filter(uf_dx | endo_dx | (is.na(uf_confident_incident) & is.na(endo_confident_incident))) %>% 
+  filter(final_outcome_status != 'Unconfirmed') %>% 
   filter(is.na(addr_NA_reason)) %>%
-  distinct(pat_id) %>% nrow()
-# Is excluded due outcome status
-ch1_cohort %>% filter(!uf_confident_incident & !endo_confident_incident) %>% distinct(pat_id) %>% nrow()
+  distinct(pat_id) %>% nrow()))
 # Is excluded due to exposure data
-length(which(!is.na(ch1_cohort$addr_NA_reason) | ch1_cohort$site_baseline == 'FLORIDA'))
+print(paste0('Missing exposure data: ', length(which(!is.na(ch1_cohort$addr_NA_reason) | 
+                                                       ch1_cohort$site_baseline == 'FLORIDA'))))
+# Outcome could not be ascertained
+print(paste0('Patients with uncertain outcome: ', ch1_cohort %>% 
+  # keep only confident cases or controls (not those with hesitant positives)
+  filter(final_outcome_status == 'Unconfirmed') %>% 
+  distinct(pat_id) %>% nrow()))
 ```
 
 ```{r flowchart}
@@ -214,11 +219,11 @@ DiagrammeR::grViz("digraph {
   
   node [shape = rectangle]        
   rec1 [label = 'Eligible Cohort (n=74,395)']
-  rec2 [label = 'Complete Outcome Data (n=73,481)']
-  rec3 [label =  'Complete Exposure Data (n=71,243)']
-  rec4 [label = 'Final sample size (n=71,243)']
-  rec5 [label = 'Excluded Patients (n=3,152)']
-  rec6 [label = 'Outcome status could \n not be ascertained (n=914)']
+  rec2 [label = 'Complete Outcome Data (n=73,181)']
+  rec3 [label =  'Complete Exposure Data (n=70,953)']
+  rec4 [label = 'Final sample size (n=70,953)']
+  rec5 [label = 'Excluded Patients (n=3,490)']
+  rec6 [label = 'Outcome status could \n not be ascertained (n=1,214)']
   rec7 [label = 'Missing exposure data (n=2,276)']
   # edge definitions with the node IDs
   rec1 -> rec2 -> rec3 -> rec4
@@ -229,24 +234,25 @@ DiagrammeR::grViz("digraph {
 
 ```{r all_data}
 all_data <- ch1_cohort %>% 
-  left_join(pat_w_covars %>% select(-site_baseline), by='pat_id') %>%
+  left_join(pat_w_covars %>% select(-site_baseline, -index_enc_date), by='pat_id') %>%
   left_join(pat_w_exposure %>% select(-geometry, -addr_NA_reason), by='pat_id') %>%
   left_join(pat_symptom_status %>% rename(symptom_time_group = time_group), by='pat_id') %>%
-  left_join(ttd_symptoms %>% select(pat_id, ttd, first_symptom_date, first_symptom_icd10s, first_symptom_dx_name), by='pat_id') %>%
+  left_join(ttd_symptoms %>% select(pat_id, ttd, first_symptom_date, first_symptom_icd10s, first_symptom_dx_name),
+            by='pat_id') %>%
   mutate(ICE_quartile = ntile(ICE_RI, 4),
          ICE_quartile = factor(ICE_quartile, labels=c('Q1', 'Q2', 'Q3', 'Q4'))) %>%
   mutate(uf_person_years = case_when(is.na(final_censor_date)~
-                                    difftime(last_enc_date, index_enc_date,units='days'),
-                                  TRUE~difftime(final_censor_date,index_enc_date,units='days')),
+                                    difftime(last_enc_date, as.Date(index_enc_date),units='days'),
+                                  TRUE~difftime(as.Date(final_censor_date),as.Date(index_enc_date),units='days')),
          uf_person_years = as.numeric(uf_person_years)/365.25,
          uf_binary = ifelse(uf_dx, 1, 0)) %>%
   mutate(endo_person_years = case_when(is.na(final_censor_date)~
-                                    difftime(last_enc_date, index_enc_date,units='days'),
-                                  TRUE~difftime(final_censor_date,index_enc_date,units='days')),
+                                    difftime(last_enc_date, as.Date(index_enc_date),units='days'),
+                                  TRUE~difftime(as.Date(final_censor_date),as.Date(index_enc_date),units='days')),
          endo_person_years = as.numeric(endo_person_years)/365.25,
          endo_binary = ifelse(endo_dx, 1, 0))
 
-write.csv(all_data, 'Data/Derived/all_data_noImpute_20240613.csv', row.names = FALSE)
+write.csv(all_data, 'Data/Derived/all_data_noImpute_20240626.csv', row.names = FALSE)
 ```
 
 
@@ -264,8 +270,8 @@ ch1_sample <- ch1_cohort %>%
          ch1_all_cases = ifelse(is.na(addr_NA_reason), TRUE, FALSE)) %>%
   select(pat_id, contains('ch1'))
 
-write.csv(ch1_final, 'Data/Derived/Chapter 1/final_dataset_20240514.csv', row.names = FALSE)
-write.csv(ch1_final, 'Data/Derived/Chapter 1/sample_flags_20240529.csv', row.names = FALSE)
+write.csv(ch1_final, 'Data/Derived/Chapter 1/final_dataset_20240626.csv', row.names = FALSE)
+write.csv(ch1_sample, 'Data/Derived/Chapter 1/sample_flags_20240626.csv', row.names = FALSE)
 ```
 
 ```{r censor_group}
@@ -763,20 +769,22 @@ There are no notable differences between the all cases cohort and the confident 
 ```{r all_cases_tab1, results='asis'}
 ch1_all_cases <- ch1_cohort %>% 
   filter(is.na(addr_NA_reason)) %>%
-  left_join(pat_w_covars %>% select(-site_baseline), by='pat_id') %>%
-  left_join(pat_w_exposure %>% select(-addr_NA_reason), by='pat_id') %>%
+  left_join(pat_w_covars %>% select(-site_baseline, -index_enc_date), by='pat_id') %>%
+  left_join(pat_w_exposure %>% select(-geometry, -addr_NA_reason), by='pat_id') %>%
   mutate(ICE_quartile = ntile(ICE_RI, 4),
          ICE_quartile = factor(ICE_quartile, labels=c('Q1', 'Q2', 'Q3', 'Q4'))) %>%
   mutate(uf_person_years = case_when(is.na(final_censor_date)~
-                                    difftime(last_enc_date, index_enc_date,units='days'),
-                                  TRUE~difftime(final_censor_date,index_enc_date,units='days')),
+                                    difftime(last_enc_date, as.Date(index_enc_date),units='days'),
+                                  TRUE~difftime(as.Date(final_censor_date),as.Date(index_enc_date),units='days')),
          uf_person_years = as.numeric(uf_person_years)/365.25,
          uf_binary = ifelse(uf_dx, 1, 0)) %>%
   mutate(endo_person_years = case_when(is.na(final_censor_date)~
-                                    difftime(last_enc_date, index_enc_date,units='days'),
-                                  TRUE~difftime(final_censor_date,index_enc_date,units='days')),
+                                    difftime(last_enc_date, as.Date(index_enc_date),units='days'),
+                                  TRUE~difftime(as.Date(final_censor_date),as.Date(index_enc_date),units='days')),
          endo_person_years = as.numeric(endo_person_years)/365.25,
-         endo_binary = ifelse(endo_dx, 1, 0))
+         endo_binary = ifelse(endo_dx, 1, 0)) %>%
+  mutate(uf_confident_incident = ifelse(!uf_icd_confirmed, NA, uf_confident_incident),
+         endo_confident_incident = ifelse(!endo_icd_confirmed, NA, endo_confident_incident),)
 
 # patient information
 summary(tableby(~hcu_baseline + age_20160801 + HC_status + parity_binary + 
@@ -1031,5 +1039,23 @@ ch1_final %>%
 ```
 
 #### {.unnumbered}
+
+### Missing exposure by patient characteristics & outcome
+
+```{r}
+ch1_cohort %>%
+  select(pat_id, final_outcome_status, uf_dx, endo_dx, site_baseline) %>%
+  filter(pat_id %in% ch1_final$pat_id | pat_id %in% not_in_nyc$pat_id) %>%
+  mutate(not_in_nyc = ifelse(pat_id %in% not_in_nyc$pat_id, TRUE, FALSE)) %>%
+  left_join(covars %>% select(pat_id, hcu_baseline, age_20160801, HC_status, parity_binary,
+                              marital_status_final, bmi_baseline, insur_status, 
+                              employ_simple_final, race_ethnic_final, language_eng_sp, adeno_fu), 
+            by='pat_id') %>%
+  tableby(not_in_nyc~final_outcome_status + hcu_baseline + age_20160801 + HC_status + parity_binary + 
+                  marital_status_final + bmi_baseline + insur_status + employ_simple_final + race_ethnic_final + 
+                  language_eng_sp + adeno_fu, data=.) %>%
+  summary(., labelTranslations = c(pat_labs, ses_labs))
+```
+
 
 ### {.unnumbered}
